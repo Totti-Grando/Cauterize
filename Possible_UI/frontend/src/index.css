@@ -1,0 +1,62 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: light;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-slate-100 text-slate-800 antialiased;
+    font-feature-settings: 'cv11', 'ss01';
+  }
+
+  /* Slim, enterprise-looking scrollbars */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #cbd5e1;
+    border-radius: 9999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #94a3b8;
+    background-clip: content-box;
+  }
+}
+
+@layer components {
+  /* Reusable card surface */
+  .card {
+    @apply rounded-xl border border-slate-200 bg-white shadow-card;
+  }
+
+  /* Section label / eyebrow */
+  .eyebrow {
+    @apply text-xs font-semibold uppercase tracking-wider text-slate-400;
+  }
+
+  /* Focus ring used across interactive elements */
+  .focusable {
+    @apply outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2 focus-visible:ring-offset-white;
+  }
+
+  /* Dotted faint grid backdrop for empty/automatic screens */
+  .grid-backdrop {
+    background-image: radial-gradient(circle, rgba(148, 163, 184, 0.25) 1px, transparent 1px);
+    background-size: 22px 22px;
+  }
+}

@@ -1,0 +1,30 @@
+# --- M0: core (architect pass) ---
+pydantic>=2.6
+numpy>=1.26
+scipy>=1.11
+PyYAML>=6.0
+pytest>=8.0
+pytest-asyncio>=0.23
+
+# --- API layer (serves the Possible_UI frontend; see aah/api/server.py) ---
+fastapi>=0.110
+uvicorn>=0.29
+boto3>=1.34                # Bedrock control-plane (list_foundation_models) + AWS cred chain
+# anthropic[bedrock]       # also needed for live Bedrock evaluator calls (SigV4 signing via boto3)
+
+# --- M1: providers + quality scorers ---
+anthropic>=0.40            # generator/judge/nli LLM (Claude). NOTE: Opus 4.7/4.8 reject
+                           #   temperature/top_p/top_k (400); determinism via 2-run averaging (§9).
+# anthropic[bedrock]       # for --eval-backend bedrock (pulls boto3 for AWS credential resolution)
+google-generativeai>=0.8   # provider-under-test (Gemini)
+trafilatura>=1.8           # source_fetch scorer (fetch+extract)
+# nli scorer is API-based (Claude) for now; local option deferred:
+# minicheck                # pulls torch+transformers (heavy on Windows; see plan note)
+# deepeval>=1.0            # optional llm_judge dimension metrics (not yet wired)
+
+# --- M4: adversarial ---
+# Probe generation + detection use a built-in heuristic baseline (no deps). The §10 borrow
+# path slots in behind the same AttackSeed / injection_detector seams:
+# garak            # 50+ probes + adaptive atkgen; AVID vuln reports = "proof of security"
+# pyrit            # multi-turn orchestration + scoring engine (MITRE ATLAS)
+# llm-guard        # OR pytector / NeMo Guardrails -- validated injection detectors (§6)

@@ -1,0 +1,35 @@
+# === Secrets & credentials — NEVER commit ===
+.env
+.env.*
+!.env.example
+**/aah/api/config.json
+
+# === Python ===
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# === Node / frontend ===
+node_modules/
+dist/
+build/
+*.local
+
+# === Runtime data / logs ===
+*.jsonl
+logs/
+runs/
+
+# === Backed-up inner git histories (local only) ===
+.git_backup/
+**/.git_backup/
+
+# === IDE / OS ===
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
