@@ -83,19 +83,56 @@ Fit to the **question** — on-topic + responsive — and it *owns* the responsi
 *Edges:* over-answering (off-ask cap + conciseness ding, not a zero); multi-part (score per part, aggregate). **Tools:** Bedrock grounding-relevance (B) or RAGAS-on-Bedrock + Titan (A) · judge (residual). **Confirm:** A vs B vs both; τ; per-claim atom via grounding-relevance vs light NLI.
 
 ---
+## 4. task_success - Major · Goal Accomplishment
 
-## 4. task_success — MAJOR · goal accomplishment
+task_success — revised design (verifier-routed), research-backed
 
-Whether the user's **objective** would actually be achieved — fit to *goal*, not question ("fix this code" answered with a correct explanation and no fix = accurate + relevant + task **failure**). **Genuinely Tier-3**: no fixed classifier judges "was the objective met" (requires inferring intent *and* verifying outcomes delivered) — the honest contrast with responsiveness, which has a reproducible proxy.
+Update to response-quality-design.md §4. The prior version treated task_success as irreducibly Tier-3 (judge every outcome). That was wrong, and the agent-evaluation literature is unambiguous about it: task success is standardly verified by a deterministic oracle, with the LLM judge as the fallback for the residue that state and rules can't capture. This section replaces §4.
 
-1. **Infer the objective** `[T3-gen]` — the intent, not the literal words ("why is this slow?" usually implies *and how to fix it*).
-2. **Classify task type + pull outcome template** `[T3]`: *fix* → {corrected artifact, root cause addressed, would run}; *explain* → {mechanism covered, right level, no critical gap}; *compare* → {both sides, stated criteria, bottom-line}; *produce* → {artifact exists, meets each constraint}; *summarize* → {key points, proportionate, nothing invented}; *recommend* → {clear rec, justified, alternatives}; *extract* → {requested value(s), correct + complete}.
-3. **Decompose into required outcomes** `[T3-gen]` — instantiate the template against this instance's specifics.
-4. **Judge each outcome achieved?** `[T3]`.
-5. **Compute** `[code]`: `task_success = |achieved| / |required outcomes|`.
+The correction
 
-*Reproducibility:* pin the task-type taxonomy + templates like any generated reference (borrows from agent **goal-completion** evaluation). *Edges:* multi-goal (decompose each, weight by primacy); implicit goals (step 1 must surface them); partial (ratio captures it, 2/3 = 0.67); impossible task (well-scoped "can't be done because X" = success, like relevance's abstention).
-**Tools:** judge (objective + per-outcome) · `numpy`. **Confirm:** task-type taxonomy + templates; multi-goal weighting.
+task_success already decomposes the objective into required outcomes — and "was this outcome achieved" is usually not a holistic judgment. It routes by outcome type to the cheapest verifier that fits, exactly like every other dimension. The research consensus:
+
+Goal achievement is typically verified by a deterministic oracle — checking database state, file-system state, or test-case execution — with a graded variant TSR_graded = (1/|T|) Σ score(τ) ∈ [0,1] for partial credit (Hitchhiker's Guide to Agentic AI, 2026).
+Two complementary evaluators: an execution evaluator that "determines task success by verifying whether the goal conditions have been met after executing the plan… examines the state of the environment and checks if all predefined goal conditions are satisfied," and a semantic evaluator used only where object/state can't fully capture the outcome (SafeAgentBench, 2024).
+Output-level scoring uses deterministic rule-based matching or a judge; environment-level scoring compares the produced terminal state against a ground-truth state via hash-based matching (following τ-bench) (Unified Framework for LLM Agentic Capabilities, 2026).
+Success-rate validation "depends on tasks and is often rule-based" — flight-booking success = satisfying budget/destination constraints; recommendation success = Recall@k — with judges/humans reserved for "more advanced" cases (Generalizability of LLM Agents survey, 2025).
+Subgoal decomposition and summation for multi-step tasks: "each subgoal is evaluated and summed"; SWE-bench success = a valid PR that passes the tests (KDD 2025 Agent-Eval tutorial).
+
+So the honest claim is not "task_success is deterministic" — it's: task_success is a verifier-routed dimension whose deterministic fraction is high and task-type-dependent — near-total for executable/structured/constrained tasks, shrinking to a small adequacy residue for open-ended, non-executable goals.
+
+Outcome-type → verifier routing
+
+Each required outcome carries a verifier tag, assigned once at template-design time (pinned, human-authored — a structural oracle):
+
+Outcome type	Verifier	Tier	Example
+artifact-presence	parse/structure check	[T1]	"a corrected code block exists", "a table is present", "a recommendation is stated"
+executable / test	run it: sandbox exec, unit test, linter, recompute	[T1]	"the fix runs", "the SQL returns the right rows", "the number is correct" (SWE-bench-style)
+state / end-condition	compare terminal state to ground truth (hash/state match)	[T1]	"the record was created", "the file has the expected contents" (τ-bench-style)
+constraint-satisfaction	reuse constraint_compliance checks	[T1]	"meets length/format", "includes X, excludes Y"
+coverage	reuse completeness's nugget-recall against a task-specific requirement set	[T2 NLI]	"covers both sides of the comparison", "explains the mechanism's key steps"
+grounded / responsive	import from accuracy / relevance	[import]	"the recommendation is justified", "answers the specific ask"
+adequacy (the residue)	judge — per-outcome binary	[T3]	"addresses the root cause", "at the right level for this audience", "the recommendation is sound"
+Revised build steps
+Infer the objective [T3-gen] — the intent, not the literal words.
+Classify task type + pull a verifier-typed outcome template [T3]. The template lists outcomes each tagged with its verifier (per the table). Templates are human-authored and pinned — and, per Konstantinou et al. (ICST 2025), LLM-written assertions tend to encode the current, possibly buggy behaviour rather than the intended one, so outcome checks are human-validated, never agent-authored for the certification set.
+Decompose into concrete required outcomes [T3-gen] — instantiate the template against this instance.
+Route each outcome to its tagged verifier — [T1] presence/execution/state/constraint · [T2] coverage/import · [T3] adequacy only. The judge fires only on adequacy outcomes, which for executable/structured task types is often zero.
+Compute [code]: task_success = Σ achieved·w / Σ w over required outcomes (graded/partial-credit TSR_graded); multi-goal weighting by primacy; impossible-task ("can't be done because X", well-scoped) = success.
+Determinism & audit note
+
+The judge footprint drops from every outcome to adequacy outcomes only. For code/SQL/numeric/structured/agentic tasks the dimension is effectively [T1] (execution + state + constraint checks that replay bit-for-bit and are far more trustworthy than a judge's opinion of whether code runs). The residual [T3] is confined to qualitative adequacy on non-executable open-ended goals, and even there it's a per-outcome boolean with code doing the aggregation. Each outcome's verifier tag and result is an AtomRecord (§0.5), so the deterministic fraction of any task_success score is visible and replayable.
+
+Confirm: the task-type taxonomy + per-outcome verifier tags; whether an execution sandbox is in scope (big determinism win for code/SQL); adequacy-outcome weighting.
+
+Sources
+Hitchhiker's Guide to Agentic AI (2026) — deterministic-oracle TSR, graded success, test-execution verification.
+SafeAgentBench (2024) — execution evaluator (goal-condition state check) + semantic-evaluator residual.
+Unified Framework for LLM Agentic Capabilities (2026) — output-level rule/judge + environment-level hash-based terminal-state matching (τ-bench).
+Generalizability of LLM Agents survey (2025) — rule-based/constraint success validation; Recall@k.
+KDD 2025 Agent-Eval tutorial — subgoal decomposition + sum; SWE-bench test-based success.
+Confident AI agent-eval guide (2026), AI Agent Evaluation (2026) — task completion "verified on the end state"; frameworks.
+Konstantinou et al., ICST 2025 — never let the agent write its own ground-truth assertions; humans validate. (cite by name)
 
 ---
 
