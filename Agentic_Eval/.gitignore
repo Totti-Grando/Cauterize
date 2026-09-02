@@ -10,3 +10,9 @@ logs/
 .idea/
 # UI-entered credentials / settings (AWS keys, provider API keys) — never commit
 aah/api/config.json
+# local NLI model weights (transfer these to the HF-blocked machine; don't commit ~360MB)
+models/
+# generated demo artifacts + install logs
+claim_graph_demo.html
+claim_tree_demo.html
+*_install.log
