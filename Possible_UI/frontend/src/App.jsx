@@ -13,6 +13,7 @@ import ResultsDashboard from './pages/09_ResultsDashboard'
 import EvidenceDetail from './pages/10_EvidenceDetail'
 import RunHistory from './pages/11_RunHistory'
 import Settings from './pages/12_Settings'
+import ClaimGraph from './pages/13_ClaimGraph'
 
 export default function App() {
   return (
@@ -27,6 +28,7 @@ export default function App() {
         <Route path="/assisted" element={<AssistedReview />} />
         <Route path="/monitor" element={<RunMonitor />} />
         <Route path="/results" element={<ResultsDashboard />} />
+        <Route path="/graph" element={<ClaimGraph />} />
         <Route path="/evidence" element={<EvidenceDetail />} />
         <Route path="/evidence/:id" element={<EvidenceDetail />} />
         <Route path="/history" element={<RunHistory />} />

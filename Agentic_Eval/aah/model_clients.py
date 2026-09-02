@@ -43,8 +43,10 @@ def _retry_after(response: httpx.Response, attempt: int) -> float:
 
 def _should_retry(status: int) -> bool:
     return status == 429 or status >= 500
-DEFAULT_GROQ_EVAL_MODEL = "llama-3.3-70b-versatile"
-DEFAULT_GROQ_TARGET_MODEL = "llama-3.1-8b-instant"
+# Groq's Llama 3.x defaults were decommissioned; the currently-served open models are the
+# gpt-oss family (see `GET /openai/v1/models`). Override per-run with --eval-model/--target-model.
+DEFAULT_GROQ_EVAL_MODEL = "openai/gpt-oss-120b"
+DEFAULT_GROQ_TARGET_MODEL = "openai/gpt-oss-20b"
 
 
 def _openai_messages(system: Optional[str], messages: list[dict]) -> list[dict]:

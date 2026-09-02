@@ -12,6 +12,7 @@ import {
   History,
   Settings,
   ShieldCheck,
+  Waypoints,
 } from 'lucide-react'
 
 const NAV = [
@@ -39,6 +40,7 @@ const NAV = [
     section: 'Results',
     items: [
       { to: '/results', label: 'Results Dashboard', icon: BarChart3 },
+      { to: '/graph', label: 'Claim Graph', icon: Waypoints },
       { to: '/evidence', label: 'Evidence Detail', icon: FileSearch },
       { to: '/history', label: 'Run History', icon: History },
     ],

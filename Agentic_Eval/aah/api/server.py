@@ -9,8 +9,8 @@ Endpoints:
   * streaming modes  — /manual/turn, /assisted/draft, /run/stream (SSE)
   * results/export    — /evaluations, /run/monitor, /runs, /runs/{id}/export
 
-Runs go through ``engine.py``: real Bedrock/provider calls when credentials are configured,
-with graceful fallback to the deterministic ``scenario.py`` fixtures otherwise.
+Runs go through ``live_engine.py``: real Bedrock/provider calls when credentials are configured,
+with graceful fallback to the deterministic ``offline_fixtures.py`` fixtures otherwise.
 """
 
 from __future__ import annotations
@@ -25,14 +25,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
-from . import engine
+from . import live_engine as engine
 from . import static_data as sd
 from ..contracts import Mode
 from ..logging_config import get_logger
-from .adapter import audit_to_evaluation
+from .ui_adapter import audit_to_evaluation
 from .config_store import store as config_store
 from .run_store import store as run_store
-from .scenario import CASES, run_scenario
+from .offline_fixtures import CASES, run_scenario
+from . import claim_graph
+from . import claim_scoring
 
 log = get_logger("api.server")
 
@@ -256,6 +258,63 @@ async def get_evaluations() -> list[dict]:
     if not store.last_evaluations:
         await run_evaluation(RunBody())
     return store.last_evaluations
+
+
+# --- claim graph --------------------------------------------------------------------
+@app.get("/api/graph")
+async def get_graph() -> dict:
+    """Claim graph (nodes/edges + orphan/AND classification) for the current evaluations.
+
+    Runs the deterministic fixtures if nothing has been evaluated yet, so this always returns a
+    renderable graph with no credentials. Identical shape for live runs."""
+    evals = store.last_evaluations or await get_evaluations()
+    src = "live" if store.last_run_live else "offline-fixtures"
+    return claim_graph.build_graph(evals, source=src)
+
+
+@app.get("/api/graph.html")
+async def get_graph_html(run_id: Optional[str] = None) -> Response:
+    """Standalone, self-contained HTML visual of the claim graph (no build step).
+
+    Defaults to the current evaluations; pass ``?run_id=RUN-...`` to render a saved run instead."""
+    if run_id:
+        rec = run_store.get(run_id)
+        evals = (rec or {}).get("evaluations") or []
+        src = f"run:{run_id}"
+    else:
+        evals = store.last_evaluations or await get_evaluations()
+        src = "live" if store.last_run_live else "offline-fixtures"
+    html = claim_graph.render_html(
+        claim_graph.build_graph(evals, source=src), title="Agentic Eval — Claim Graph"
+    )
+    return Response(content=html, media_type="text/html")
+
+
+@app.get("/api/runs/{run_id}/graph")
+def get_run_graph(run_id: str) -> dict:
+    """Claim graph for a previously saved run (from the Run History audit trail)."""
+    rec = run_store.get(run_id)
+    evals = (rec or {}).get("evaluations") if rec else None
+    if not evals:
+        return claim_graph.build_graph([], source=f"run:{run_id} (no evaluations)")
+    return claim_graph.build_graph(evals, source=f"run:{run_id}")
+
+
+# --- nodal claim tree (per-claim truthfulness scoring: min / axiom-gated max) --------
+@app.get("/api/claim-tree")
+def get_claim_tree() -> dict:
+    """Scored claim DAG: anchored (min-of-3) + derived (axiom-gated max/min) + orphan nodes.
+
+    Serves the deterministic demo tree (no model, like the offline fixtures). When live
+    claim-extraction lands, this same shape is produced from a real run."""
+    return claim_scoring.to_graph(claim_scoring.demo_claim_tree(), source="demo-claim-tree")
+
+
+@app.get("/api/claim-tree.html")
+def get_claim_tree_html() -> Response:
+    """Standalone, self-contained HTML of the scored claim tree (click a node for its sub-scores)."""
+    graph = claim_scoring.to_graph(claim_scoring.demo_claim_tree(), source="demo-claim-tree")
+    return Response(content=claim_scoring.render_html(graph), media_type="text/html")
 
 
 # --- streaming mode flows (SSE) -----------------------------------------------------

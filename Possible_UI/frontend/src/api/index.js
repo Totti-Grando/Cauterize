@@ -118,6 +118,33 @@ export const api = {
     return request(`/runs/${runId}`)
   },
 
+  // --- claim graph (nodes/edges + orphan/AND classification) ---
+  async getGraph(runId) {
+    if (USE_MOCK) {
+      await mockDelay(200)
+      return { source: 'mock', summary: { evaluations: 0, nodes: 0, edges: 0, orphans: 0, gates: 0, verdicts: {} }, graphs: [] }
+    }
+    return request(runId ? `/runs/${runId}/graph` : '/graph')
+  },
+
+  // URL of the self-contained interactive HTML canvas (embedded in an <iframe>).
+  graphHtmlUrl(runId) {
+    return `${API_BASE}/graph.html${runId ? `?run_id=${encodeURIComponent(runId)}` : ''}`
+  },
+
+  // --- nodal claim tree (per-claim truthfulness scoring) ---
+  async getClaimTree() {
+    if (USE_MOCK) {
+      await mockDelay(200)
+      return { source: 'mock', nodes: [], edges: [], stats: { nodes: 0, anchored: 0, derived: 0, orphans: 0, bands: {} }, axiom_threshold: 0.75 }
+    }
+    return request('/claim-tree')
+  },
+
+  claimTreeHtmlUrl() {
+    return `${API_BASE}/claim-tree.html`
+  },
+
   async exportCsv(runId = 'current') {
     if (USE_MOCK) {
       await mockDelay(500)

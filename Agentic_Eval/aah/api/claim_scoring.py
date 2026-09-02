@@ -1,0 +1,409 @@
+"""Nodal claim scoring: a claim DAG with per-node truthfulness rollups.
+
+This is an ADDITIVE layer — it never touches the frozen contracts (``BinaryQuestion``,
+``AuditRecord``, ``Verdict``). It computes a separate claim tree whose nodes carry their own
+sub-scores and a composite ``score`` derived bottom-up. A run that never builds a claim tree is
+unaffected; this is the same "extend, don't modify" discipline as ``AuditRecord → AssuranceRecord``.
+
+Node kinds and their scoring (locked with the user):
+
+* **anchored** — a claim grounded directly in a source. Three truthfulness sub-scores:
+  ``groundedness``, ``source_attribution``, ``source_quality``. Its score is the WEAKEST LINK::
+
+      score = min(groundedness, source_attribution, source_quality)
+
+* **derived** — a claim reasoned from parent claims. Two of its own signals combine, but ONLY if
+  its premises are trustworthy enough to reason from — the *axiom gate*::
+
+      m = min( load-bearing parents' scores )          # OR-groups reduced by max; non-load-bearing excluded
+      if m >= AXIOM_THRESHOLD:   score = max(own_truthfulness, reasoning_fidelity)   # good logic can exceed thin grounding
+      else:                      score = min(own_truthfulness, reasoning_fidelity)   # reasoning from weak premises is meaningless
+
+  This is why ``max`` is SAFE: it can only lift a claim when its load-bearing premises are already
+  axiom-grade, so coherent-but-unsupported reasoning cannot launder itself green.
+
+* **orphan** — no source anchor, no load-bearing parents, no reasoning. Its value collapses to
+  relevance. Relevance is a STUB here (``relevance`` field, defaulting to an abstain) to be sharpened
+  later; the rollup treats it as the score.
+
+Load-bearing AND/OR (the "and/or relations" from the original ask): a parent link is ``load_bearing``
+when the premise is independently necessary (AND). Parents sharing an ``or_group`` are alternatives
+(OR) — the group contributes its ``max`` (best available). Non-load-bearing parents are excluded from
+the gate entirely.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+AXIOM_THRESHOLD = 0.75          # load-bearing parents at/above this are treated as axioms (tunable)
+
+# Display bands (independent of the gate threshold; purely for coloring the node).
+_BAND_GREEN, _BAND_AMBER = 0.75, 0.5
+
+
+@dataclass
+class ParentLink:
+    """A derived claim's dependency on a parent claim.
+
+    ``load_bearing`` — the premise is independently necessary (an AND term). Only load-bearing
+    parents feed the axiom gate. ``or_group`` — parents sharing a group id are alternatives (OR);
+    the group is reduced by ``max`` (best available) before entering the gate ``min``.
+    """
+
+    parent_id: str
+    load_bearing: bool = True
+    or_group: Optional[str] = None
+
+
+@dataclass
+class ClaimNode:
+    id: str
+    text: str
+    kind: str = "anchored"                       # anchored | derived | orphan
+    # truthfulness sub-scores (anchored uses all three; derived measures its own where it can)
+    groundedness: Optional[float] = None
+    source_attribution: Optional[float] = None
+    source_quality: Optional[float] = None
+    # derived-only signals
+    reasoning_fidelity: Optional[float] = None    # entailed reasoning steps / total (0..1)
+    parents: list[ParentLink] = field(default_factory=list)
+    # orphan-only (STUB — relevance to be enhanced later)
+    relevance: Optional[float] = None
+    # --- computed by score_tree (do not set by hand) ---
+    own_truthfulness: Optional[float] = None      # min of the three sub-scores
+    parent_min: Optional[float] = None            # m — the axiom gate value
+    score: Optional[float] = None
+    branch: str = ""                              # which rule fired, for the audit trail / tooltip
+    note: str = ""
+
+
+def _min_defined(*vals: Optional[float]) -> Optional[float]:
+    present = [v for v in vals if v is not None]
+    return min(present) if present else None
+
+
+def _own_truthfulness(n: ClaimNode) -> Optional[float]:
+    """min of whichever of the three truthfulness sub-scores are present (the weakest link)."""
+    return _min_defined(n.groundedness, n.source_attribution, n.source_quality)
+
+
+def _gate_value(node: ClaimNode, scored: dict[str, float]) -> Optional[float]:
+    """m = min over load-bearing parents; OR-groups reduced by max; non-load-bearing excluded."""
+    loose: list[float] = []
+    groups: dict[str, list[float]] = {}
+    for link in node.parents:
+        if not link.load_bearing:
+            continue
+        ps = scored.get(link.parent_id)
+        if ps is None:
+            continue
+        if link.or_group:
+            groups.setdefault(link.or_group, []).append(ps)
+        else:
+            loose.append(ps)
+    contributions = loose + [max(g) for g in groups.values() if g]
+    return min(contributions) if contributions else None
+
+
+def _score_node(node: ClaimNode, scored: dict[str, float]) -> None:
+    """Fill node.score/own_truthfulness/parent_min/branch from already-scored parents."""
+    own = _own_truthfulness(node)
+    node.own_truthfulness = own
+
+    if node.kind == "orphan":
+        node.score = node.relevance
+        node.branch = "orphan:relevance"
+        node.note = "no anchor/parents/reasoning — relevance stub (enhance later)"
+        return
+
+    if node.kind == "anchored":
+        node.score = own
+        node.branch = "anchored:min(3)"
+        return
+
+    # derived
+    m = _gate_value(node, scored)
+    node.parent_min = m
+    rf = node.reasoning_fidelity
+    two = [v for v in (own, rf) if v is not None]
+
+    if m is None:
+        # tagged derived but has no usable load-bearing parents — degenerate. Fall back to whatever
+        # the claim can stand on itself (own truthfulness, else reasoning, else abstain).
+        node.score = own if own is not None else rf
+        node.branch = "derived:no-parents→self"
+        node.note = "derived claim with no load-bearing parents; scored on its own signals"
+        return
+
+    if not two:
+        # nothing about the claim itself; it can be no stronger than its weakest premise.
+        node.score = m
+        node.branch = "derived:self-signals-missing→parent_min"
+        return
+
+    if len(two) == 1:
+        # only one of {own, reasoning} present; max/min of a single value is itself. The gate still
+        # matters when reasoning is the lone signal: below threshold, reasoning is meaningless.
+        if rf is not None and own is None and m < AXIOM_THRESHOLD:
+            node.score = min(rf, m)
+            node.branch = "derived:reasoning-only,below-axiom→min(rf,m)"
+        else:
+            node.score = two[0]
+            node.branch = "derived:single-signal"
+        return
+
+    if m >= AXIOM_THRESHOLD:
+        node.score = max(own, rf)
+        node.branch = f"derived:axiom(m={m:.2f}≥{AXIOM_THRESHOLD})→max(own,rf)"
+    else:
+        node.score = min(own, rf)
+        node.branch = f"derived:below-axiom(m={m:.2f}<{AXIOM_THRESHOLD})→min(own,rf)"
+
+
+def score_tree(nodes: dict[str, ClaimNode]) -> dict[str, ClaimNode]:
+    """Score every node bottom-up (parents before children), in place. Cycle-safe.
+
+    Returns the same dict for convenience. A dependency cycle is broken defensively: a node still
+    waiting on an unresolved (cyclic) parent is scored with whatever parents ARE resolved, and the
+    back-edge is ignored, so scoring always terminates and never raises on malformed input.
+    """
+    scored: dict[str, float] = {}
+    visiting: set[str] = set()
+    order: list[str] = []
+
+    def visit(nid: str) -> None:
+        if nid in scored or nid not in nodes:
+            return
+        if nid in visiting:
+            return  # cycle back-edge — skip; the dependent node will score on resolved parents only
+        visiting.add(nid)
+        for link in nodes[nid].parents:
+            visit(link.parent_id)
+        visiting.discard(nid)
+        if nid not in scored:
+            _score_node(nodes[nid], scored)
+            scored[nid] = nodes[nid].score if nodes[nid].score is not None else 0.0
+            order.append(nid)
+
+    for nid in list(nodes):
+        visit(nid)
+    return nodes
+
+
+def band(score: Optional[float]) -> str:
+    if score is None:
+        return "abstain"
+    if score >= _BAND_GREEN:
+        return "green"
+    if score >= _BAND_AMBER:
+        return "amber"
+    return "red"
+
+
+def to_graph(nodes: dict[str, ClaimNode], *, source: str = "") -> dict:
+    """Convert a scored claim tree into the {nodes, edges, stats} shape the renderer consumes."""
+    gnodes = []
+    for n in nodes.values():
+        gnodes.append({
+            "id": n.id, "type": n.kind, "label": (n.text[:60] + "…") if len(n.text) > 60 else n.text,
+            "full": n.text, "kind": n.kind, "score": n.score, "band": band(n.score),
+            "groundedness": n.groundedness, "source_attribution": n.source_attribution,
+            "source_quality": n.source_quality, "own_truthfulness": n.own_truthfulness,
+            "reasoning_fidelity": n.reasoning_fidelity, "parent_min": n.parent_min,
+            "relevance": n.relevance, "branch": n.branch, "note": n.note,
+            "threshold": AXIOM_THRESHOLD, "orphan": n.kind == "orphan",
+        })
+    gedges = []
+    for n in nodes.values():
+        for link in n.parents:
+            gedges.append({
+                "source": link.parent_id, "target": n.id, "kind": "supports",
+                "relation": "or" if link.or_group else "and",
+                "load_bearing": link.load_bearing, "or_group": link.or_group,
+            })
+    stats = {
+        "nodes": len(gnodes), "edges": len(gedges),
+        "anchored": sum(1 for n in nodes.values() if n.kind == "anchored"),
+        "derived": sum(1 for n in nodes.values() if n.kind == "derived"),
+        "orphans": sum(1 for n in nodes.values() if n.kind == "orphan"),
+        "bands": {b: sum(1 for n in nodes.values() if band(n.score) == b)
+                  for b in ("green", "amber", "red", "abstain")},
+    }
+    _layout(gnodes, gedges)
+    return {"source": source, "nodes": gnodes, "edges": gedges, "stats": stats,
+            "axiom_threshold": AXIOM_THRESHOLD}
+
+
+# --- DAG layout: evidence (leaves) on the left, conclusions on the right ------------
+_COL_W, _ROW_H = 300, 104
+
+
+def _layout(gnodes: list[dict], gedges: list[dict]) -> None:
+    """Layer each node by its longest dependency depth (leaves=0), then stack within the layer."""
+    parents_of: dict[str, list[str]] = {n["id"]: [] for n in gnodes}
+    for e in gedges:
+        if e["target"] in parents_of:
+            parents_of[e["target"]].append(e["source"])
+    depth: dict[str, int] = {}
+
+    def d(nid: str, seen: frozenset = frozenset()) -> int:
+        if nid in depth:
+            return depth[nid]
+        if nid in seen:                       # cycle guard
+            return 0
+        ps = parents_of.get(nid, [])
+        val = 0 if not ps else 1 + max(d(p, seen | {nid}) for p in ps)
+        depth[nid] = val
+        return val
+
+    for n in gnodes:
+        d(n["id"])
+    by_layer: dict[int, list[dict]] = {}
+    for n in gnodes:
+        by_layer.setdefault(depth[n["id"]], []).append(n)
+    for layer, group in by_layer.items():
+        group.sort(key=lambda n: (0 if not n.get("orphan") else 1, n["id"]))
+        for i, n in enumerate(group):
+            n["x"] = 80 + layer * _COL_W
+            n["y"] = 60 + i * _ROW_H
+
+
+def demo_claim_tree() -> dict[str, ClaimNode]:
+    """A deterministic finance-flavored claim tree that exercises EVERY scoring branch.
+
+    Mirrors the offline-fixtures spirit: no model, hand-built so the graph lands on visibly different
+    node scores (weakest-link red, max-above-axiom green, min-below-axiom amber, OR-group, orphan)."""
+    nodes = [
+        # anchored leaves (source-grounded)
+        ClaimNode(id="a_rev", text="Q3 revenue was $4.2B", kind="anchored",
+                  groundedness=0.95, source_attribution=0.92, source_quality=0.88),
+        ClaimNode(id="a_margin", text="Cloud gross margin improved YoY", kind="anchored",
+                  groundedness=0.90, source_attribution=0.85, source_quality=0.80),
+        # weakest-link demo: strong grounding but a low-quality source drags min to 0.40
+        ClaimNode(id="a_inquiry", text="A regulatory inquiry opened in August", kind="anchored",
+                  groundedness=0.88, source_attribution=0.90, source_quality=0.40),
+        # unsupported demo: everything low
+        ClaimNode(id="a_cov", text="Coverage volume rose 18%", kind="anchored",
+                  groundedness=0.30, source_attribution=0.30, source_quality=0.35),
+        # derived — above axiom -> max(own, reasoning) lifts it
+        ClaimNode(id="d_growth", text="Cloud is the primary growth driver", kind="derived",
+                  groundedness=0.60, source_attribution=0.60, source_quality=0.62, reasoning_fidelity=0.90,
+                  parents=[ParentLink("a_rev"), ParentLink("a_margin")]),
+        # derived — below axiom (weak inquiry premise) -> min(own, reasoning) holds it back
+        ClaimNode(id="d_risk", text="The issuer's risk profile materially increased", kind="derived",
+                  groundedness=0.65, source_attribution=0.65, source_quality=0.68, reasoning_fidelity=0.92,
+                  parents=[ParentLink("a_inquiry")]),
+        # derived — OR-group (inquiry OR coverage) + a strong AND parent (growth), still below axiom
+        ClaimNode(id="d_outlook", text="Near-term outlook carries elevated risk", kind="derived",
+                  groundedness=0.70, source_attribution=0.72, source_quality=0.75, reasoning_fidelity=0.80,
+                  parents=[ParentLink("d_growth"),
+                           ParentLink("a_inquiry", or_group="signal"),
+                           ParentLink("a_cov", or_group="signal")]),
+        # orphan — floating fact, no anchor/parents/reasoning -> relevance stub only
+        ClaimNode(id="o_ceo", text="The CEO previously worked at a competitor", kind="orphan", relevance=0.35),
+    ]
+    return score_tree({n.id: n for n in nodes})
+
+
+def render_html(graph: dict, title: str = "Claim Tree — nodal scoring") -> str:
+    """Render a ``to_graph`` payload as a single self-contained HTML doc: DAG canvas (pan/zoom),
+    band-colored nodes, AND (solid) / OR (dashed) support edges, and a click-to-open panel showing
+    every sub-score and which rule fired."""
+    import json as _json
+
+    data = _json.dumps(graph).replace("</", "<\\/")
+    esc = (title or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return _TREE_HTML.replace("__TITLE__", esc).replace("__PAYLOAD__", data)
+
+
+_TREE_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>__TITLE__</title><style>
+ :root{--bg:#0f1420;--panel:#161d2e;--line:#2a3350;--txt:#e6ebf5;--mut:#8b97b5;
+   --green:#22c55e;--amber:#eab308;--red:#ef4444;--abstain:#64748b;}
+ *{box-sizing:border-box}html,body{margin:0;height:100%;font:14px/1.4 system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--txt)}
+ #app{display:flex;height:100vh}#main{flex:1;position:relative;overflow:hidden}
+ #panel{width:320px;flex:0 0 320px;background:var(--panel);border-left:1px solid var(--line);padding:16px;overflow:auto}
+ #panel h2{font-size:14px;margin:0 0 2px}#panel .k{color:var(--mut);font-size:12px}
+ .row{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px dashed var(--line);font-size:12px}
+ .row b{font-weight:600}.pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:700}
+ .bar{height:7px;border-radius:4px;background:#0d1322;overflow:hidden;margin-top:3px}.bar>span{display:block;height:100%}
+ #hint{position:absolute;left:12px;bottom:10px;color:var(--mut);font-size:11px}
+ #legend{position:absolute;left:12px;top:10px;font-size:11px;color:var(--mut);background:rgba(11,16,28,.7);padding:8px 10px;border-radius:8px;border:1px solid var(--line)}
+ #legend .r{display:flex;align-items:center;gap:6px;padding:1px 0}#legend .sw{width:16px;height:10px;border-radius:3px}
+ svg{width:100%;height:100%;cursor:grab}svg.drag{cursor:grabbing}
+ .node{cursor:pointer}.node text{fill:var(--txt);pointer-events:none}.node .s{font-size:11px;font-weight:700}
+ .node .m{font-size:10px;fill:var(--mut)}
+</style></head><body><div id="app">
+ <div id="main"><svg id="svg"><g id="view"></g></svg>
+   <div id="legend"></div>
+   <div id="hint">scroll = zoom · drag = pan · click a node for its scoring</div></div>
+ <div id="panel"><div class="k">Select a node</div><h2>__TITLE__</h2>
+   <div class="k" id="thr"></div><div id="detail" style="margin-top:12px"></div></div>
+</div><script>
+const G=__PAYLOAD__, NS="http://www.w3.org/2000/svg", NW=232, NH=66;
+const BAND={green:"#22c55e",amber:"#eab308",red:"#ef4444",abstain:"#64748b"};
+const $=id=>document.getElementById(id);
+function el(t,a){const e=document.createElementNS(NS,t);for(const k in(a||{}))e.setAttribute(k,a[k]);return e;}
+const pct=v=>v==null?"—":Math.round(v*100)+"%";
+$("thr").textContent="axiom threshold = "+pct(G.axiom_threshold)+" (load-bearing parents)";
+$("legend").innerHTML=["green","amber","red","abstain"].map(b=>`<div class="r"><span class="sw" style="background:${BAND[b]}"></span>${b}</div>`).join("")
+  +`<div class="r" style="margin-top:4px"><span class="sw" style="border-top:2px solid #94a3b8;height:0"></span>AND (load-bearing)</div>`
+  +`<div class="r"><span class="sw" style="border-top:2px dashed #94a3b8;height:0"></span>OR (alternative)</div>`;
+function drawBar(v){const c=v==null?BAND.abstain:(v>=0.75?BAND.green:v>=0.5?BAND.amber:BAND.red);
+  return `<div class="bar"><span style="width:${Math.round((v||0)*100)}%;background:${c}"></span></div>`;}
+function detail(n){
+  const rows=[];
+  const sub=(k,v)=>v==null?"":`<div class="row"><span>${k}</span><b>${pct(v)}</b></div>${drawBar(v)}`;
+  rows.push(`<h2>${(n.full||n.label).replace(/</g,"&lt;")}</h2>`);
+  rows.push(`<div style="margin:6px 0 10px"><span class="pill" style="background:${BAND[n.band]}22;color:${BAND[n.band]}">${n.kind} · ${n.band}</span>
+     <span style="float:right;font-weight:700;font-size:18px">${pct(n.score)}</span></div>`);
+  if(n.kind!=="orphan"){
+    rows.push(`<div class="k" style="margin-bottom:2px">truthfulness sub-scores</div>`);
+    rows.push(sub("groundedness",n.groundedness));
+    rows.push(sub("source attribution",n.source_attribution));
+    rows.push(sub("source quality",n.source_quality));
+    rows.push(`<div class="row"><span>own truthfulness = min(3)</span><b>${pct(n.own_truthfulness)}</b></div>`);
+  }
+  if(n.kind==="derived"){
+    rows.push(`<div class="k" style="margin:10px 0 2px">reasoning</div>`);
+    rows.push(sub("reasoning fidelity",n.reasoning_fidelity));
+    rows.push(`<div class="row"><span>load-bearing parents min (m)</span><b>${pct(n.parent_min)}</b></div>`);
+  }
+  if(n.kind==="orphan"){rows.push(sub("relevance (stub)",n.relevance));}
+  rows.push(`<div class="k" style="margin:12px 0 2px">rule applied</div><div style="font-size:12px">${n.branch}</div>`);
+  if(n.note)rows.push(`<div class="k" style="margin-top:8px">${n.note}</div>`);
+  $("detail").innerHTML=rows.join("");
+}
+function draw(){
+  const view=$("view");view.innerHTML="";const pos={};G.nodes.forEach(n=>pos[n.id]=n);
+  G.edges.forEach(e=>{const a=pos[e.source],b=pos[e.target];if(!a||!b)return;
+    const x1=a.x+NW,y1=a.y+NH/2,x2=b.x,y2=b.y+NH/2,mx=(x1+x2)/2;
+    view.appendChild(el("path",{d:`M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`,fill:"none",
+      stroke:"#94a3b8",opacity:e.load_bearing?0.9:0.5,"stroke-width":e.load_bearing?2:1.3,
+      "stroke-dasharray":e.relation==="or"?"6 4":""}));});
+  G.nodes.forEach(n=>{const c=BAND[n.band]||BAND.abstain;
+    const g=el("g",{class:"node",transform:`translate(${n.x},${n.y})`});
+    g.appendChild(el("rect",{width:NW,height:NH,rx:10,ry:10,fill:c+"1f",
+      stroke:n.orphan?"#ef4444":c,"stroke-width":2,"stroke-dasharray":n.orphan?"5 3":""}));
+    const t=el("text",{x:12,y:22});t.textContent=n.label;g.appendChild(t);
+    const m=el("text",{x:12,y:40,class:"m"});m.textContent=n.kind+(n.kind==="derived"?` · m=${pct(n.parent_min)}`:"");g.appendChild(m);
+    const s=el("text",{x:12,y:56,class:"s",fill:c});s.textContent=pct(n.score)+" "+n.band;g.appendChild(s);
+    g.addEventListener("click",()=>detail(n));view.appendChild(g);});
+  fit();
+}
+let vx=0,vy=0,vs=1;const apply=()=>$("view").setAttribute("transform",`translate(${vx},${vy}) scale(${vs})`);
+function fit(){const xs=G.nodes.map(n=>n.x),ys=G.nodes.map(n=>n.y);if(!xs.length)return;
+  const w=$("main").clientWidth,h=$("main").clientHeight;
+  const maxx=Math.max(...xs)+NW+40,maxy=Math.max(...ys)+NH+40,minx=Math.min(...xs)-20,miny=Math.min(...ys)-20;
+  vs=Math.min(1,Math.min(w/(maxx-minx),h/(maxy-miny)));vx=-minx*vs+10;vy=-miny*vs+10;apply();}
+const svg=$("svg");
+svg.addEventListener("wheel",e=>{e.preventDefault();const f=e.deltaY<0?1.1:0.9;const r=svg.getBoundingClientRect();
+  const mx=e.clientX-r.left,my=e.clientY-r.top;vx=mx-(mx-vx)*f;vy=my-(my-vy)*f;vs*=f;apply();},{passive:false});
+let dn=false,px,py;svg.addEventListener("mousedown",e=>{dn=true;px=e.clientX;py=e.clientY;svg.classList.add("drag");});
+addEventListener("mouseup",()=>{dn=false;svg.classList.remove("drag");});
+addEventListener("mousemove",e=>{if(!dn)return;vx+=e.clientX-px;vy+=e.clientY-py;px=e.clientX;py=e.clientY;apply();});
+draw();if(G.nodes.length)detail(G.nodes.find(n=>n.kind!=="anchored")||G.nodes[0]);
+</script></body></html>"""
