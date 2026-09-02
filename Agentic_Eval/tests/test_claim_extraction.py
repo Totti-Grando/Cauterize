@@ -11,7 +11,7 @@ import pytest
 
 from aah.api.claim_extraction import (
     ClaimParent, ExtractedClaim, LlmClaimExtractor, StubClaimExtractor,
-    _coerce_claims, _loads_array, build_claim_nodes, extract_and_score,
+    _attribution, _citations, _coerce_claims, _loads_array, build_claim_nodes, extract_and_score,
 )
 
 _Q = "What drove Q3 results and what risks emerged?"
@@ -113,3 +113,45 @@ def test_llm_extractor_parses_injected_client_response():
 def test_empty_answer_yields_empty_tree():
     tree = _run(extract_and_score(_Q, "", _CTX))
     assert tree == {}
+
+
+# --- source attribution (citation validity) --------------------------------------------
+_EVIDENCE = [{"title": "Q3 filing", "domain": "sec.gov"},
+             {"title": "Newswire report", "domain": "newswire.example.com"}]
+
+
+def test_citations_are_extracted():
+    refs = _citations("Revenue rose, according to the Q3 filing, and per Newswire report.")
+    joined = " ".join(refs).lower()
+    assert "filing" in joined and "newswire" in joined
+    assert _citations("Revenue simply rose this quarter.") == []      # no citation
+
+
+def test_attribution_present_for_cited_in_set_source():
+    assert _attribution("Revenue rose according to the Q3 filing", _EVIDENCE) == 1.0
+
+
+def test_attribution_zero_for_fabricated_citation():
+    # cites a source that is NOT in the provided evidence set -> fabricated -> 0.0
+    assert _attribution("Profits doubled according to the Bloomberg terminal", _EVIDENCE) == 0.0
+
+
+def test_attribution_none_when_no_citation_or_no_evidence():
+    assert _attribution("Revenue rose this quarter", _EVIDENCE) is None       # nothing cited -> N/A
+    assert _attribution("per the Q3 filing", []) is None                      # no source set -> N/A
+
+
+def test_fabricated_citation_drags_claim_score_via_min():
+    async def go():
+        claims = [ExtractedClaim("c0", "Profits tripled according to the Bloomberg terminal", "anchored")]
+        # grounding forced high so attribution is the deciding (weakest) factor
+        async def high(*_a):
+            return 0.95
+        return await build_claim_nodes(claims, response="", context="", question="",
+                                       evidence=_EVIDENCE, grounded=high)
+
+    tree = _run(go())
+    n = tree["c0"]
+    assert n.source_attribution == 0.0
+    assert n.own_truthfulness == 0.0            # min(grounded=0.95, attribution=0.0, quality) == 0.0
+    assert n.score == 0.0

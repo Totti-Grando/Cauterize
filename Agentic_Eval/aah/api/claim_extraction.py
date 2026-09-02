@@ -95,9 +95,11 @@ class StubClaimExtractor:
                 steps = [s.strip() for s in re.split(r",|;|\band\b|\bbecause\b|\bso\b", sent) if len(s.strip()) > 8]
                 parents = [ClaimParent(pid) for pid in anchored_ids[-2:]]  # lean on the last couple of facts
                 claims.append(ExtractedClaim(cid, sent, "derived", parents, steps or [sent]))
-            elif _overlap(sent, context) < 0.2 and _overlap(sent, question) < 0.2:
+            elif not _citations(sent) and _overlap(sent, context) < 0.2 and _overlap(sent, question) < 0.2:
+                # no citation and unrelated to both the question and the sources -> a floating aside
                 claims.append(ExtractedClaim(cid, sent, "orphan"))
             else:
+                # a plain assertion, or one that cites a source (anchored even if unsupported)
                 claims.append(ExtractedClaim(cid, sent, "anchored"))
                 anchored_ids.append(cid)
         return claims
@@ -203,6 +205,64 @@ def _quality_from_evidence(claim: str, evidence: Sequence[dict]) -> float:
     return round(best or 0.4, 4)      # a claim matching no source has thin quality
 
 
+# --- source attribution: are the claim's cited sources actually in the provided set? -----------
+_CITE_RES = [re.compile(p, re.I) for p in (
+    r"according to\s+([^.,;:()\[\]]+)",
+    r"\bper\s+(?:the\s+)?([^.,;:()\[\]]+)",
+    r"based on\s+([^.,;:()\[\]]+)",
+    r"cited in\s+([^.,;:()\[\]]+)",
+    r"reported by\s+([^.,;:()\[\]]+)",
+    r"source:\s*([^.,;:()\[\]]+)",
+    r"\bthe\s+([A-Za-z0-9\-' ]+?(?:filing|report|article|statement|press release|"
+    r"earnings (?:call|report)|10-?[kq]|8-?k))\b",
+)]
+_URL_RE = re.compile(r"https?://\S+", re.I)
+
+
+def _citations(text: str) -> list[str]:
+    """Extract explicit source references from a claim (attribution phrases, doc types, URLs)."""
+    refs: list[str] = []
+    for rx in _CITE_RES:
+        for m in rx.finditer(text or ""):
+            ref = m.group(1).strip()
+            if len(ref) > 2:
+                refs.append(ref)
+    refs.extend(_URL_RE.findall(text or ""))
+    return list(dict.fromkeys(refs))
+
+
+def _best_evidence_match(ref: str, evidence: Sequence[dict]) -> Optional[dict]:
+    """The evidence item a citation ``ref`` refers to (by content-word overlap), or None if the
+    cited source is not in the provided set (a fabricated citation)."""
+    rw = _content_words(ref)
+    if not rw:
+        return None
+    best, best_ov = None, 0.0
+    for ev in evidence:
+        ev_text = " ".join(str(ev.get(k) or "") for k in
+                           ("title", "domain", "canonicalUrl", "sourceUrl", "url"))
+        ew = _content_words(ev_text)
+        ov = len(rw & ew) / len(rw) if ew else 0.0
+        if ov > best_ov:
+            best, best_ov = ev, ov
+    return best if best_ov >= 0.34 else None
+
+
+def _attribution(claim: str, evidence: Sequence[dict]) -> Optional[float]:
+    """Citation validity for one claim: every cited source must exist in the provided set.
+
+    Returns 1.0 when all cited sources are present, 0.0 when any citation is fabricated (cites a doc
+    not in the set), and None when the claim makes no citation (attribution N/A — not penalized) or
+    there is no source set to check against."""
+    if not evidence:
+        return None
+    refs = _citations(claim)
+    if not refs:
+        return None
+    scores = [1.0 if _best_evidence_match(r, evidence) else 0.0 for r in refs]
+    return round(min(scores), 4)
+
+
 async def build_claim_nodes(
     extracted: Sequence[ExtractedClaim], *, response: str, context: str, question: str = "",
     evidence: Optional[Sequence[dict]] = None,
@@ -211,15 +271,14 @@ async def build_claim_nodes(
 ) -> dict[str, ClaimNode]:
     """Bind per-claim truthfulness + reasoning scores and return the SCORED ClaimNode tree.
 
-    ``grounded``/``attribution`` default to the deterministic overlap proxies; ``reasoning`` to the
-    graded overlap. Pass NLI/judge-backed callables for the live path (e.g. wrap ``ClaudeNLIScorer``
-    for grounding, and ``explainability.reasoning_fidelity`` with an NLI ``entails`` for reasoning).
-    Source quality comes from the evidence support levels.
+    ``grounded`` defaults to the deterministic overlap proxy; ``reasoning`` to the graded overlap.
+    Pass NLI-backed callables for the live/local path. ``source_attribution`` is the deterministic
+    citation-validity check against ``evidence`` (an injected ``attribution`` scorer overrides it);
+    ``source_quality`` comes from the evidence support levels.
     """
     grounded = grounded or _det_grounded
-    attribution = attribution or _det_grounded          # attribution ~ overlap with a cited source
     reasoning = reasoning or _det_reasoning
-    evidence = evidence or []
+    evidence = list(evidence or [])
     nodes: dict[str, ClaimNode] = {}
 
     for c in extracted:
@@ -231,7 +290,10 @@ async def build_claim_nodes(
             node.relevance = round(_overlap(c.text, question), 4) if question else 0.3
         else:
             node.groundedness = await grounded(c.text, response, context)
-            node.source_attribution = await attribution(c.text, response, context)
+            # source attribution = citation validity (cited sources must be in the set); an injected
+            # scorer overrides, else the deterministic citation check. None => N/A (min ignores it).
+            node.source_attribution = (await attribution(c.text, response, context)
+                                       if attribution is not None else _attribution(c.text, evidence))
             node.source_quality = _quality_from_evidence(c.text, evidence)
             if c.kind == "derived":
                 node.reasoning_fidelity = await reasoning(c.reasoning_steps, context)
@@ -249,9 +311,7 @@ def live_scorers(async_client: Any, model: str, *, max_concurrency: int = 2) -> 
     reasoning fidelity is the fraction of a derived claim's steps entailed by the context. Calls are
     throttled by a semaphore so free-tier rate limits (HTTP 429) aren't tripped by a burst.
 
-    ``attribution`` is intentionally ``None`` here — a distinct "cited the right source" signal isn't
-    wired yet (deferred alongside source_quality/relevance), so ``own_truthfulness`` = min(grounded,
-    source_quality) rather than paying a second NLI call per claim for a placeholder.
+    No ``attribution`` key is returned, so the binder uses its deterministic citation-validity check.
     """
     import asyncio as _asyncio
 
@@ -277,18 +337,15 @@ def live_scorers(async_client: Any, model: str, *, max_concurrency: int = 2) -> 
         vals = await _asyncio.gather(*[grounded(s, "", context) for s in steps])
         return round(sum(vals) / len(vals), 4)
 
-    async def _skip(*_a) -> Optional[float]:      # explicit skip -> source_attribution stays unset
-        return None
-
-    return {"grounded": grounded, "attribution": _skip, "reasoning": reasoning}
+    return {"grounded": grounded, "reasoning": reasoning}
 
 
 def local_scorers(cfg: Any = None) -> dict:
     """Build ``grounded``/``reasoning`` from the LOCAL transformer NLI model (no API, no rate limit).
 
     This is the design-intended grounding path (dedicated NLI, not an LLM judge): each claim is
-    entailed-checked against the source context, graded 0..1. ``attribution`` stays deferred (skip).
-    Pair with :func:`prewarm_grounding` before binding for batched speed on a slow device.
+    entailed-checked against the source context, graded 0..1. Attribution falls to the binder's
+    deterministic citation-validity check. Pair with :func:`prewarm_grounding` for batched speed.
     """
     import asyncio as _asyncio
 
@@ -303,10 +360,7 @@ def local_scorers(cfg: Any = None) -> dict:
         vals = await _asyncio.gather(*[grounded(s, "", context) for s in steps])
         return round(sum(vals) / len(vals), 4)
 
-    async def _skip(*_a) -> Optional[float]:
-        return None
-
-    return {"grounded": grounded, "attribution": _skip, "reasoning": reasoning}
+    return {"grounded": grounded, "reasoning": reasoning}
 
 
 async def prewarm_grounding(claims: Sequence[ExtractedClaim], context: str, cfg: Any = None) -> None:
