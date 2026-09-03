@@ -26,11 +26,24 @@ from typing import Any, Awaitable, Callable, Optional, Sequence
 
 from .claim_scoring import ClaimNode, ParentLink, score_tree
 
-# reasoning connectives that mark a sentence as a *derived* conclusion
-_CONNECTIVES = (
-    "therefore", "thus", "hence", "so ", "because", "since", "as a result", "driven by",
-    "suggests", "indicates", "implies", "means that", "leading to", "consequently", "due to",
-)
+# reasoning connectives that split a sentence into premise -> conclusion.
+# forward:  <premise> CONN <conclusion>   (the conclusion is derived FROM the premise)
+_FWD_RE = re.compile(
+    r"\b(therefore|thus|hence|consequently|as a result|which means|means that|"
+    r"implies|implying|leading to|so)\b", re.I)
+# backward: <conclusion> CONN <premise>   (the premise justifies the conclusion)
+_BWD_RE = re.compile(r"\b(because|since|due to|driven by|owing to|as a consequence of)\b", re.I)
+# coordinate separators that string independent clauses into one sentence -> split into atomic facts.
+# bare commas are deliberately NOT separators (they would shred "1,200" and plain noun lists).
+_COORD_RE = re.compile(
+    r"\s*;\s*|\s*,?\s+and\s+|\s*,?\s+but\s+|\s*,?\s+while\s+|\s*,?\s+whereas\s+", re.I)
+# opinion/sentiment markers -> a subjective aside is an orphan, not a groundable fact, even when it
+# carries a proper noun (e.g. "The CEO seemed optimistic").
+_SUBJECTIVE = frozenset((
+    "seemed", "seems", "appears", "appeared", "felt", "feels", "nice", "optimistic", "pessimistic",
+    "impressive", "exciting", "excited", "happy", "unfortunate", "unfortunately", "interesting",
+    "great", "wonderful", "remarkable", "encouraging", "disappointing", "lovely", "amazing", "hopeful",
+))
 _SUPPORT_SCORE = {"strong": 0.9, "partial": 0.6, "weak": 0.4, "not_evaluable": 0.3, "": 0.5}
 # common words filtered from the overlap proxy so function words don't inflate grounding
 _STOP = frozenset((
@@ -85,34 +98,104 @@ def _has_salient(text: str) -> bool:
     return any(w[:1].isupper() for w in words[1:])       # a capitalized word after the first
 
 
+# --- clause atomizer ----------------------------------------------------------------
+def _is_subjective(text: str) -> bool:
+    """A clause whose assertion is an opinion/sentiment, not a checkable fact."""
+    return bool(_content_words(text) & _SUBJECTIVE)
+
+
+def _atomize(text: str) -> list[str]:
+    """Split one clause into atomic facts on coordinate separators (and/but/while/;), then merge back
+    any fragment too thin to stand alone. This splits "$4.2B and margin hit 30%" into two full
+    clauses while keeping noun pairs like "research and development" together."""
+    text = (text or "").strip(" ,.;:")
+    if not text:
+        return []
+    parts = [p.strip(" ,.;:") for p in _COORD_RE.split(text)]
+    parts = [p for p in parts if p]
+    merged: list[str] = []
+    for p in parts:
+        if merged and (len(_content_words(p)) < 2 or len(_content_words(merged[-1])) < 2):
+            merged[-1] = f"{merged[-1]} and {p}"          # rejoin a fragment that can't stand alone
+        else:
+            merged.append(p)
+    return merged or [text]
+
+
+def _reasoning_split(sent: str) -> Optional[tuple[str, str]]:
+    """Split a sentence at its first reasoning connective into (premise, conclusion), where the
+    conclusion is a *derived* claim justified by the premise. Returns None if no connective yields a
+    contentful conclusion."""
+    fwd, bwd = _FWD_RE.search(sent), _BWD_RE.search(sent)
+    if fwd and bwd:
+        m, forward = (fwd, True) if fwd.start() <= bwd.start() else (bwd, False)
+    elif fwd:
+        m, forward = fwd, True
+    elif bwd:
+        m, forward = bwd, False
+    else:
+        return None
+    left, right = sent[:m.start()].strip(" ,.;:"), sent[m.end():].strip(" ,.;:")
+    premise, conclusion = (left, right) if forward else (right, left)
+    if len(_content_words(conclusion)) < 2:
+        return None
+    return premise, conclusion
+
+
 # --- extractors ---------------------------------------------------------------------
 class StubClaimExtractor:
-    """Deterministic, model-free extraction: sentence-split + connective/overlap heuristics.
+    """Deterministic, model-free extraction: atomic-clause splitting + connective/overlap heuristics.
 
-    A sentence with a reasoning connective is ``derived`` (its load-bearing parents are the preceding
-    anchored claims); a sentence that overlaps neither the question nor the context is an ``orphan``;
-    everything else is ``anchored``. Good enough to exercise the whole pipeline offline.
+    Each sentence is first split at a reasoning connective into a **premise** (anchored fact) and a
+    **conclusion** (a ``derived`` claim whose load-bearing parents are the recent anchored facts).
+    Each side is then atomized on coordinate separators so "A and B" become two independent claims. A
+    subjective aside is an ``orphan``; a fact overlapping neither the question nor the context is an
+    ``orphan``; everything else is ``anchored``. A ``derived`` clause with no available parent falls
+    back to a plain fact — never a dangling derived node. Good enough to exercise the pipeline offline.
     """
 
     async def extract(self, question: str, response: str, context: str) -> list[ExtractedClaim]:
         claims: list[ExtractedClaim] = []
         anchored_ids: list[str] = []
-        for i, sent in enumerate(_split_sentences(response)):
-            cid = f"c{i}"
-            low = sent.lower()
-            is_derived = any(k in low for k in _CONNECTIVES)
-            if is_derived:
-                steps = [s.strip() for s in re.split(r",|;|\band\b|\bbecause\b|\bso\b", sent) if len(s.strip()) > 8]
-                parents = [ClaimParent(pid) for pid in anchored_ids[-2:]]  # lean on the last couple of facts
-                claims.append(ExtractedClaim(cid, sent, "derived", parents, steps or [sent]))
-            elif (not _citations(sent) and not _has_salient(sent)
-                  and _overlap(sent, context) < 0.2 and _overlap(sent, question) < 0.2):
-                # no citation, no number/proper-noun, unrelated to question AND sources -> floating aside
-                claims.append(ExtractedClaim(cid, sent, "orphan"))
+        counter = 0
+
+        def _add_fact(text: str) -> Optional[str]:
+            nonlocal counter
+            text = text.strip(" ,.;:")
+            if len(_content_words(text)) < 2:
+                return None                               # too thin to be a claim
+            cid = f"c{counter}"
+            counter += 1
+            if _is_subjective(text) and not _citations(text):
+                kind = "orphan"                           # opinion/sentiment aside
+            elif (_citations(text) or _has_salient(text)
+                  or _overlap(text, context) >= 0.2 or _overlap(text, question) >= 0.2):
+                kind = "anchored"                         # a fact meant to be grounded
             else:
-                # a plain assertion, or one that cites a source (anchored even if unsupported)
-                claims.append(ExtractedClaim(cid, sent, "anchored"))
+                kind = "orphan"                           # floating, off-topic aside
+            claims.append(ExtractedClaim(cid, text, kind))
+            if kind == "anchored":
                 anchored_ids.append(cid)
+            return cid
+
+        for sent in _split_sentences(response):
+            split = _reasoning_split(sent)
+            if split:
+                premise, conclusion = split
+                for part in _atomize(premise):
+                    _add_fact(part)                       # premise clause(s) -> anchored facts
+                parents = [ClaimParent(pid) for pid in anchored_ids[-2:]]   # lean on the last facts
+                ctext = conclusion.strip(" ,.;:")
+                if parents and len(_content_words(ctext)) >= 2:
+                    claims.append(ExtractedClaim(f"c{counter}", ctext, "derived", parents,
+                                                 _atomize(conclusion) or [ctext]))
+                    counter += 1
+                else:
+                    for part in _atomize(ctext):          # no parent -> plain facts, never a dangling
+                        _add_fact(part)                    # derived node (and still atomically split)
+            else:
+                for part in _atomize(sent):
+                    _add_fact(part)
         return claims
 
 

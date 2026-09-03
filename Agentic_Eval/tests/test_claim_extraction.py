@@ -37,6 +37,47 @@ def test_stub_tags_anchored_derived_and_orphan():
     assert orph.kind == "orphan"                            # overlaps neither question nor context
 
 
+def test_conjunction_splits_into_atomic_claims():
+    # "A and B" packing two independent facts must become TWO claims (they ground separately)
+    claims = _run(StubClaimExtractor().extract(
+        "Q3?", "Revenue rose 12% to $4.2B and operating margin expanded to 30%.", ""))
+    assert len(claims) == 2
+    texts = [c.text.lower() for c in claims]
+    assert any("revenue" in t for t in texts) and any("margin" in t for t in texts)
+    assert all(c.kind == "anchored" for c in claims)      # both carry numbers -> anchored
+
+
+def test_noun_pair_is_not_over_split():
+    # "research and development" is one noun phrase, not two claims -> must stay together
+    claims = _run(StubClaimExtractor().extract(
+        "Spend?", "Research and development spending reached $2 billion.", ""))
+    assert len(claims) == 1 and "research and development" in claims[0].text.lower()
+
+
+def test_premise_and_conclusion_are_separated():
+    # a fact + its inference must split: anchored premise, derived conclusion linked to it
+    claims = _run(StubClaimExtractor().extract(
+        "Q3?", "Net income was $900M, therefore EPS beat consensus.", ""))
+    anchored = [c for c in claims if c.kind == "anchored"]
+    derived = [c for c in claims if c.kind == "derived"]
+    assert any("900" in c.text for c in anchored)         # the fact stands on its own
+    assert derived and "eps beat" in derived[0].text.lower()
+    assert derived[0].parents and derived[0].parents[0].parent_id in {c.id for c in anchored}
+
+
+def test_subjective_aside_is_orphan_even_with_proper_noun():
+    # "CEO" is a proper noun, but the assertion is sentiment -> orphan, not a false anchor
+    claims = _run(StubClaimExtractor().extract("Reaction?", "The CEO seemed optimistic.", ""))
+    assert len(claims) == 1 and claims[0].kind == "orphan"
+
+
+def test_no_dangling_derived_without_a_parent():
+    # a conclusion with no prior anchored fact must NOT become a parentless derived node
+    claims = _run(StubClaimExtractor().extract("Weather?", "Therefore it will rain tomorrow.", ""))
+    assert not any(c.kind == "derived" for c in claims)
+    assert all(c.parents for c in claims if c.kind == "derived")
+
+
 def test_deterministic_grounding_is_overlap_against_context():
     tree = _run(extract_and_score(_Q, _R, _CTX))
     rev = next(n for n in tree.values() if "revenue" in n.text)
