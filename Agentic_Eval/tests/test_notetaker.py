@@ -14,7 +14,7 @@ import json
 
 from aah.contracts import Dimension, Lesson, LessonKind, Mode, Subtype
 from aah.layer_b.notetaker import ClaudeNoteTaker, StubNoteTaker
-from aah.layer_b.signals import Failure
+from aah.layer_b.failure_signals import Failure
 
 
 class _FakeBlock:

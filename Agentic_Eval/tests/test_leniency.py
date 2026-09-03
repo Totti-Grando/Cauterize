@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from aah.contracts import Dimension, EvalMethod, Mode
-from aah.guards import flag_lenient_dimensions
+from aah.determinism_guards import flag_lenient_dimensions
 from aah.layer_a.pipeline import run_once
 from aah.layer_a.providers import FixtureProvider
 from aah.layer_a.question_gen import StubQuestionGenerator

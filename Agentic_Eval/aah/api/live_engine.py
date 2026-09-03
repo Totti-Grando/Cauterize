@@ -16,7 +16,7 @@ import os
 from typing import Any, Optional
 
 from ..contracts import AgentInfo, Mode, Provenance
-from ..families import same_family
+from ..model_families import same_family
 from ..logging_config import get_logger
 from ..layer_a.providers.base import ProviderAdapter
 from .config_store import ConfigStore
@@ -83,7 +83,7 @@ def evaluator_ready(store: ConfigStore) -> bool:
         except Exception:  # noqa: BLE001
             return False
     if backend == "groq":
-        from ..llm import resolve_groq_key
+        from ..model_clients import resolve_groq_key
         return bool(resolve_groq_key())
     if backend == "anthropic":
         return bool(os.environ.get("ANTHROPIC_API_KEY"))
@@ -98,7 +98,7 @@ def provider_ready(store: ConfigStore, provider_id: str) -> bool:
     if adapter == "http":
         return bool(p.get("endpoint"))
     if adapter == "groq":
-        from ..llm import resolve_groq_key
+        from ..model_clients import resolve_groq_key
         return bool(p.get("api_key") or resolve_groq_key())
     if adapter == "gemini":
         return bool(p.get("api_key") or os.environ.get("GEMINI_API_KEY"))
@@ -116,7 +116,7 @@ def is_live_ready(store: ConfigStore, provider_id: str) -> bool:
 # --------------------------------------------------------------------------------------
 def build_evaluator(store: ConfigStore) -> tuple[Any, Any, str]:
     """(sync_client, async_client, model) for the evaluator role."""
-    from ..llm import make_evaluator
+    from ..model_clients import make_evaluator
     backend = (store.evaluator.get("backend") or "bedrock").lower()
     model = store.evaluator.get("model") or None
     return make_evaluator(backend, model)
@@ -144,7 +144,7 @@ def build_provider(store: ConfigStore, provider_id: str, context: Optional[str] 
         )
     elif adapter == "groq":
         from ..layer_a.providers.groq import GroqProvider
-        from ..llm import DEFAULT_GROQ_TARGET_MODEL
+        from ..model_clients import DEFAULT_GROQ_TARGET_MODEL
         inner = GroqProvider(model=model or DEFAULT_GROQ_TARGET_MODEL, api_key=key or None)
     elif adapter == "gemini":
         from ..layer_a.providers.gemini import GeminiProvider
@@ -412,7 +412,7 @@ def _attack_rubric():
 
 def plan_run(store: ConfigStore, provider_id: str, mode: Mode, n: int) -> Plan:
     """Build a Plan for the automatic/assisted run: live when ready, else fixtures."""
-    from . import scenario, static_data as sd
+    from . import offline_fixtures as scenario, static_data as sd
     from ..config import default_weight_config
     from ..layer_a.router import default_router
     from ..layer_a.question_gen import StubQuestionGenerator
@@ -466,7 +466,7 @@ def plan_manual(store: ConfigStore, provider_id: str, question: str, context: Op
     attack   → the message is escalated into a more dangerous probe (seeded by lessons) and THAT
                is sent to the configured provider, scored by the injection detector.
     """
-    from . import scenario, static_data as sd
+    from . import offline_fixtures as scenario, static_data as sd
     from ..config import default_weight_config
     from ..layer_a.providers import FixtureProvider
     from ..layer_a.router import default_router
@@ -528,7 +528,7 @@ def plan_manual(store: ConfigStore, provider_id: str, question: str, context: Op
 
 def _plan_round(store: ConfigStore, provider_id: str, objective: str, lessons_acc: list[dict], i: int) -> Plan:
     """One round of the automatic Layer B loop (single job), seeded by accumulated lessons."""
-    from . import scenario, static_data as sd
+    from . import offline_fixtures as scenario, static_data as sd
     from ..config import default_weight_config
     from ..layer_a.providers import FixtureProvider
     from ..layer_a.router import default_router
@@ -588,10 +588,10 @@ def _plan_round(store: ConfigStore, provider_id: str, objective: str, lessons_ac
 async def _stream_job(plan: Plan, job: "Job", i: int, counters: dict):
     """Stream one turn/round: question → answer → evaluation → lessons (+ steps/metrics)."""
     from ..contracts import AuditRecord
-    from ..layer_a.aggregator import aggregate
+    from ..layer_a.aggregator import aggregate, effective_weights_of, focus_profile
     from ..layer_b.lessons import dedup_and_prune
-    from ..layer_b.signals import collect_failures
-    from .adapter import audit_to_evaluation
+    from ..layer_b.failure_signals import collect_failures
+    from .ui_adapter import audit_to_evaluation
 
     qid = job.meta.get("questionId", f"Q-{i+1}")
 
@@ -643,6 +643,8 @@ async def _stream_job(plan: Plan, job: "Job", i: int, counters: dict):
                 evaluator=evalr, provider=prov,
                 same_family_judge=same_family(evalr.backend, evalr.model, prov.backend, prov.model),
             ),
+            focus=focus_profile(plan.config),
+            effective_weights=effective_weights_of(scores),
         )
         evaluation = audit_to_evaluation(record, job.meta)
     except Exception as exc:  # noqa: BLE001
@@ -727,7 +729,7 @@ def draft_question(store: ConfigStore, provider_id: str, index: int = 0) -> dict
     Live: generate a question with the evaluator LLM and ask it for short review tips.
     Offline: return the next scenario case's question + its rationale as tips.
     """
-    from . import scenario
+    from . import offline_fixtures as scenario
 
     cases = scenario.CASES
     case = cases[index % len(cases)]

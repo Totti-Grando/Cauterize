@@ -35,4 +35,4 @@ def test_skeleton_runs_end_to_end():
     assert record.scores.overall == 1.0
     assert not record.scores.failed
     # The full WeightConfig travels with the record (§7.6).
-    assert record.weight_config.version == "v0"
+    assert record.weight_config.version == "v1"

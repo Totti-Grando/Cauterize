@@ -145,6 +145,25 @@ export const api = {
     return `${API_BASE}/claim-tree.html`
   },
 
+  // POST a real answer (+ optional sources) and get back the self-contained interactive HTML of the
+  // scored claim tree, to drop into an <iframe srcdoc>. Returns HTML text (not JSON).
+  async extractClaimTreeHtml(body) {
+    if (USE_MOCK) {
+      await mockDelay(300)
+      return '<!doctype html><meta charset="utf-8"><body style="font:14px system-ui;color:#889">mock mode — no backend</body>'
+    }
+    const res = await fetch(`${API_BASE}/claim-tree/extract.html`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body ?? {}),
+    })
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '')
+      throw new Error(`extract failed: ${res.status} ${detail}`)
+    }
+    return res.text()
+  },
+
   async exportCsv(runId = 'current') {
     if (USE_MOCK) {
       await mockDelay(500)

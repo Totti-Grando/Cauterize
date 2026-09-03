@@ -19,8 +19,8 @@ from typing import Any, Awaitable, Callable, Optional
 from ..contracts import AuditRecord, Mode
 from .lessons import dedup_and_prune
 from .notetaker import NoteTaker
-from .results import IterationRecord, OptimizationResult
-from .signals import collect_failures
+from .loop_results import IterationRecord, OptimizationResult
+from .failure_signals import collect_failures
 from .updater import Updater
 
 # A Layer A driver: given the current P_Q and iteration index, run A over the seeds.

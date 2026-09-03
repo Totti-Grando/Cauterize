@@ -15,9 +15,9 @@ from typing import Optional
 
 from ..config import default_weight_config
 from ..contracts import AgentInfo, AuditRecord, Mode, Provenance, RunScore, Tier, Verdict, WeightConfig
-from ..families import same_family
-from ..guards import combine_runs, kept_after_phi_dedup
-from .aggregator import aggregate
+from ..model_families import same_family
+from ..determinism_guards import combine_runs, kept_after_phi_dedup
+from .aggregator import aggregate, effective_weights_of, focus_profile
 from .providers.base import ProviderAdapter
 from .question_gen import QuestionGenerator
 from .router import EvaluatorRouter
@@ -127,7 +127,7 @@ async def run_once(
     # Step 6c: per-dimension yes-rate summary (F6) for leniency monitoring.
     yes_rate_summary = _yes_rate_by_dimension(rubric, verdicts)
 
-    # Step 7: emit the AuditRecord.
+    # Step 7: emit the AuditRecord (R7: stamp the focus profile + effective weights).
     return AuditRecord(
         mode=mode,
         task=seed,
@@ -141,6 +141,8 @@ async def run_once(
         iteration=iteration,
         provenance=provenance,
         yes_rate_summary=yes_rate_summary,
+        focus=focus_profile(config),
+        effective_weights=effective_weights_of(scores),
     )
 
 

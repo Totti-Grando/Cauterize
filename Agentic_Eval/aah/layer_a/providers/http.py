@@ -23,7 +23,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 
-from ...llm import _MAX_RETRIES, _retry_after, _should_retry
+from ...model_clients import _MAX_RETRIES, _retry_after, _should_retry
 from .base import ProviderAdapter
 
 Poster = Callable[[str, dict, dict], Awaitable[dict]]

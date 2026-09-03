@@ -16,7 +16,7 @@ import os
 import random
 from pathlib import Path
 
-from .env import load_dotenv
+from .env_loader import load_dotenv
 from .logging_config import get_cli_logger, setup_logging
 
 # CLI human-readable output goes through logging (stdout + captured in logs/aah.log).
@@ -262,7 +262,7 @@ def _make_provider(backend: str, model, args=None):
     b = backend.lower()
     if b == "groq":
         from .layer_a.providers.groq import GroqProvider
-        from .llm import DEFAULT_GROQ_TARGET_MODEL
+        from .model_clients import DEFAULT_GROQ_TARGET_MODEL
         return GroqProvider(model=model or DEFAULT_GROQ_TARGET_MODEL)
     if b == "gemini":
         from .layer_a.providers.gemini import GeminiProvider
@@ -306,7 +306,7 @@ async def _run_live(args) -> None:
     model-under-test answers, the scorers grade it, and the §7 aggregator gates the result.
     Evaluator and target backends are independently selectable (groq | anthropic | gemini)."""
 
-    from .llm import make_evaluator
+    from .model_clients import make_evaluator
     from .layer_a.question_gen import ClaudeQuestionGenerator
     from .layer_a.rubric_gen import StagedRubricGenerator
     from .layer_a.seeds import EXAMPLE_SEEDS, seed_to_text
@@ -360,8 +360,8 @@ async def _run_learn(args) -> None:
     rubric each iteration, the NoteTaker generalizes the defects, and the Updater grows the
     rubric generator's guidance until the critic is satisfied. Evolves the rubric prompt, live."""
 
-    from .llm import make_evaluator
-    from .layer_a.aggregator import aggregate
+    from .model_clients import make_evaluator
+    from .layer_a.aggregator import aggregate, effective_weights_of, focus_profile
     from .config import default_weight_config
     from .contracts import AuditRecord, Mode as _Mode
     from .layer_a.question_gen import ClaudeQuestionGenerator
@@ -393,14 +393,17 @@ async def _run_learn(args) -> None:
         rubric = ClaudeRubricGenerator(
             client=sync_client, model=eval_model, guidance=guidance
         ).build(question, context)
+        rubric_scores = aggregate([], rubric, cfg)
         record = AuditRecord(
             mode=_Mode.QUALITY, task=seed_to_text(seed), question=question, response="",
-            rubric=rubric, verdicts=[], scores=aggregate([], rubric, cfg),
+            rubric=rubric, verdicts=[], scores=rubric_scores,
             weight_config=cfg, prompt_version=f"P_R@v{i}",
             provenance=Provenance(  # F1: rubric-quality loop is judge-only
                 evaluator=AgentInfo(backend=args.eval_backend, model=eval_model),
                 provider=AgentInfo(backend="none", model="(rubric-only)"),
             ),
+            focus=focus_profile(cfg),
+            effective_weights=effective_weights_of(rubric_scores),
         )
         return [record]
 
@@ -463,7 +466,7 @@ def main() -> None:
     # Load keys from .env into the environment (shell vars still win).
     load_dotenv(args.env)
     setup_logging(force=True)  # re-apply AAH_LOG_LEVEL now that .env is loaded
-    from .llm import resolve_groq_key
+    from .model_clients import resolve_groq_key
     detected = []
     if os.environ.get("ANTHROPIC_API_KEY", "").startswith("sk-ant-"):
         detected.append("anthropic")

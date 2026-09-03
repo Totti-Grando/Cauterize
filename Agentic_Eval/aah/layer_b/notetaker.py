@@ -13,7 +13,7 @@ import re
 from typing import Any, Protocol
 
 from ..contracts import Lesson, LessonKind, Mode
-from .signals import Failure
+from .failure_signals import Failure
 
 
 class NoteTaker(Protocol):

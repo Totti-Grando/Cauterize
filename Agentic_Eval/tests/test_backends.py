@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
-import aah.llm as llm
+import aah.model_clients as llm
 from aah.layer_a.providers.http import HttpProvider, _get_path, _set_path
 
 

@@ -26,7 +26,7 @@ async def test_record_always_has_non_null_evaluator_and_provider_model():
     )
     assert record.provenance.evaluator.model  # non-empty
     assert record.provenance.provider.model   # non-empty
-    assert record.schema_version == "v1"
+    assert record.schema_version == "v1.1"
 
 
 async def test_explicit_provenance_is_recorded():

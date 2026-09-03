@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from aah.config import default_weight_config
 from aah.contracts import Dimension, EvalMethod, Verdict
-from aah.guards import kept_after_phi_dedup
+from aah.determinism_guards import kept_after_phi_dedup
 from aah.layer_a.aggregator import aggregate
 from tests.conftest import make_question
 

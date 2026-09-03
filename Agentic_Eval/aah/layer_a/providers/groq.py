@@ -11,7 +11,7 @@ import asyncio
 
 import httpx
 
-from ...llm import (
+from ...model_clients import (
     GROQ_CHAT_URL,
     DEFAULT_GROQ_TARGET_MODEL,
     _MAX_RETRIES,

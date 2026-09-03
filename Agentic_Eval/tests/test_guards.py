@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from aah.guards import (
+from aah.determinism_guards import (
     asserts_claim,
     combine_runs,
     extract_numbers,

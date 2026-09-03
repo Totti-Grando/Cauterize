@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from aah.env import load_dotenv
+from aah.env_loader import load_dotenv
 
 
 def test_parses_keys_comments_export_and_quotes(tmp_path, monkeypatch):

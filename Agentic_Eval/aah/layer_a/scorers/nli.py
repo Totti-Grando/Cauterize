@@ -113,7 +113,7 @@ Poster = Callable[[str, dict, dict], Awaitable[dict]]
 async def _httpx_poster(url: str, headers: dict, payload: dict) -> dict:
     import httpx  # local import keeps module import cheap
 
-    from ...llm import _MAX_RETRIES, _retry_after, _should_retry
+    from ...model_clients import _MAX_RETRIES, _retry_after, _should_retry
 
     async with httpx.AsyncClient(timeout=60) as client:
         for attempt in range(_MAX_RETRIES):

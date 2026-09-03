@@ -327,8 +327,7 @@ class ClaimTreeBody(BaseModel):
     grounding: Optional[str] = "deterministic"      # deterministic | local | llm | retrieval
 
 
-@app.post("/api/claim-tree/extract")
-async def extract_claim_tree(body: ClaimTreeBody) -> dict:
+async def _extract_claim_graph(body: ClaimTreeBody) -> dict:
     """Extract a scored claim DAG from a real answer + source context.
 
     ``extract``: how claims are decomposed — ``stub`` (offline heuristics) or ``llm`` (Groq).
@@ -374,6 +373,21 @@ async def extract_claim_tree(body: ClaimTreeBody) -> dict:
                                    evidence=body.evidence, grounded=sc.get("grounded"),
                                    attribution=sc.get("attribution"), reasoning=sc.get("reasoning"))
     return claim_scoring.to_graph(tree, source=f"extract:{ex}/ground:{grounding}")
+
+
+@app.post("/api/claim-tree/extract")
+async def extract_claim_tree(body: ClaimTreeBody) -> dict:
+    """Scored claim DAG (JSON) for a real answer + sources. See :func:`_extract_claim_graph`."""
+    return await _extract_claim_graph(body)
+
+
+@app.post("/api/claim-tree/extract.html")
+async def extract_claim_tree_html(body: ClaimTreeBody) -> Response:
+    """Same as ``/extract`` but returns the self-contained interactive HTML of the scored tree,
+    so the UI can render a REAL extracted answer (not just the demo) via an iframe ``srcdoc``."""
+    graph = await _extract_claim_graph(body)
+    return Response(content=claim_scoring.render_html(graph, title="Claim Tree — extracted"),
+                    media_type="text/html")
 
 
 # --- streaming mode flows (SSE) -----------------------------------------------------

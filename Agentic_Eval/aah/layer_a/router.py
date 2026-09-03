@@ -59,6 +59,23 @@ class RealEvaluatorRouter:
             )
         return await scorer.score(question, response, context)
 
+    def assert_covers_taxonomy(self) -> None:
+        """R2: every taxonomy dimension must resolve to a registered scorer via its default
+        ``eval_method`` (config.taxonomy.DIMENSION_EVAL_METHOD). Raises at load if any dimension
+        routes to a method this router has no scorer for."""
+        from ..config.taxonomy import DIMENSION_EVAL_METHOD
+
+        unresolved = {
+            dim.value: method.value
+            for dim, method in DIMENSION_EVAL_METHOD.items()
+            if method not in self._scorers
+        }
+        if unresolved:
+            raise KeyError(
+                f"router does not cover all dimensions: {unresolved} "
+                f"(a dimension's default eval_method has no registered scorer)"
+            )
+
 
 def default_router(
     client: Any = None,
@@ -82,4 +99,6 @@ def default_router(
         EvalMethod.SOURCE_CHECK: FabricationScorer(),  # F3: deterministic fabrication gate
         EvalMethod.LLM_JUDGE: ClaudeJudgeScorer(client=client, model=model),
     }
-    return RealEvaluatorRouter(scorers)
+    router = RealEvaluatorRouter(scorers)
+    router.assert_covers_taxonomy()  # R2: fail at load if any dimension has no competent scorer
+    return router

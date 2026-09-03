@@ -15,7 +15,7 @@ import re
 from typing import Any, Awaitable, Callable, Optional
 
 from ..contracts import AuditRecord, BinaryQuestion, Mode
-from .signals import Failure
+from .failure_signals import Failure
 
 _SYSTEM = (
     "You audit an evaluation RUBRIC for quality defects that would make its scores "

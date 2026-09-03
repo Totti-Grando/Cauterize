@@ -1,12 +1,17 @@
 """Frozen §4 data contracts + §4/§6 enums. Import everything from here."""
 
 from .enums import (
+    Band,
+    Category,
     Dimension,
+    Disposition,
     EvalMethod,
     LessonKind,
+    LineOfDefence,
     Mode,
     Subtype,
     Tier,
+    Trend,
 )
 from .models import (
     AgentInfo,
@@ -22,15 +27,36 @@ from .models import (
     Verdict,
     WeightConfig,
 )
+from .assurance import (
+    AggregateRisk,
+    AssuranceRecord,
+    CoverageScope,
+    DimensionAssessment,
+    DimensionPolicy,
+    EvaluatorReliability,
+    EvidenceLink,
+    GarBands,
+    KRIAlert,
+    MetricPoint,
+    Override,
+    Reviewer,
+    RiskPolicy,
+    ScorerReliability,
+)
 
 __all__ = [
     # enums
+    "Band",
+    "Category",
     "Dimension",
+    "Disposition",
     "EvalMethod",
     "LessonKind",
+    "LineOfDefence",
     "Mode",
     "Subtype",
     "Tier",
+    "Trend",
     # models
     "AgentInfo",
     "AuditRecord",
@@ -44,4 +70,19 @@ __all__ = [
     "RunScore",
     "Verdict",
     "WeightConfig",
+    # governance (Layer C)
+    "AggregateRisk",
+    "AssuranceRecord",
+    "CoverageScope",
+    "DimensionAssessment",
+    "DimensionPolicy",
+    "EvaluatorReliability",
+    "EvidenceLink",
+    "GarBands",
+    "KRIAlert",
+    "MetricPoint",
+    "Override",
+    "Reviewer",
+    "RiskPolicy",
+    "ScorerReliability",
 ]

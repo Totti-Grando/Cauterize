@@ -66,6 +66,10 @@ class DimensionScore(_Frozen):
     gating: bool
     score: float = Field(ge=0.0, le=1.0)
     weight: float = Field(ge=0.0, le=1.0)  # cross-dimension weight w_d (0 for gating dims)
+    # R4 coverage invariant: an active dimension with no data ABSTAINS — it appears in the record
+    # (coverage checks for everything) but contributes no score/weight to the overall. ``score`` is
+    # 0.0 and meaningless when ``abstained``; read this flag before the score.
+    abstained: bool = False
 
 
 class PruneThresholds(_Frozen):
@@ -80,12 +84,23 @@ class WeightConfig(_Frozen):
     major_minor_ratio: float = 2.0  # MAJOR tierweight / MINOR tierweight (§7.3, only lever)
     prune_thresholds: PruneThresholds = PruneThresholds()
     gate_thresholds: dict[Dimension, float] = Field(default_factory=dict)  # per CRITICAL dim
+    # Taxonomy §1 (R3): a *scored* (MAJOR/MINOR) dimension can still veto the run when a 0-verdict
+    # carries one of these subtypes — e.g. hallucination scores as a MAJOR quality dim, but a
+    # fabricated_source/invented_policy failure gates. Empty => the dimension only gates via tier /
+    # must_pass. Travels in the record so the gate decision replays.
+    gating_subtypes: dict[Dimension, frozenset[Subtype]] = Field(default_factory=dict)
     # F5: a gating dimension can absorb a single false positive by setting its threshold just
     # below 1.0 (must_pass checks ALWAYS stay zero-tolerance regardless of this). And when a
     # rubric contains any gating-dimension check, evaluate at >= gating_min_runs so noise damps
     # toward the safe side via conservative-to-fail averaging rather than a single flip deciding.
     gating_min_runs: int = 2
-    version: str = "v0"
+    # Taxonomy §2 (R5): the focus profile. ``focus_dimensions`` are the resolved dims this run is
+    # "about" (from selected categories or sub-dimensions); each carries ``focus_boost`` in the
+    # scored weight: effective_weight(d) = tierweight(d) x (focus_boost if d in focus else 1.0).
+    # Focus is orthogonal to tier — CRITICAL tierweight is 0, so gates fire independently of focus.
+    focus_dimensions: frozenset[Dimension] = Field(default_factory=frozenset)
+    focus_boost: float = 2.0
+    version: str = "v1"  # bumped from v0: added gating_subtypes + focus (taxonomy §1/§2)
 
 
 class RunScore(_Frozen):
@@ -158,6 +173,11 @@ class AuditRecord(_Frozen):
     weight_config: WeightConfig
     prompt_version: str            # P_Q version that produced ``question``
     iteration: int = 0
-    schema_version: str = "v1"     # bumped when the audit schema changes (F1 added provenance)
+    schema_version: str = "v1.1"   # v1.1: added taxonomy §2 focus profile + effective weights (R7)
     provenance: Provenance = Field(default_factory=Provenance)
     yes_rate_summary: dict[str, float] = Field(default_factory=dict)  # F6: per-dimension yes-rate
+    # Taxonomy §2 (R7): the focus profile this run used (dimension values) and the resulting
+    # normalized effective (tier x focus) weights per scored dimension. Both default empty so a
+    # legacy / no-focus run still validates; ``effective_weights`` mirrors scores.per_dimension.
+    focus: list[str] = Field(default_factory=list)
+    effective_weights: dict[str, float] = Field(default_factory=dict)

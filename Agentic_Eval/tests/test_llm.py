@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import aah.llm as llm
+import aah.model_clients as llm
 from aah.layer_a.scorers.base import extract_text
 
 

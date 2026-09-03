@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from aah.api import engine, scenario
-from aah.api.adapter import audit_to_evaluation
+from aah.api import live_engine as engine, offline_fixtures as scenario
+from aah.api.ui_adapter import audit_to_evaluation
 from aah.api.config_store import ConfigStore
 from aah.contracts import Mode
 

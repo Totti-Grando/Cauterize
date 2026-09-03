@@ -12,10 +12,11 @@ from tests.conftest import make_question, make_verdict
 
 def _clean_rubric():
     # MAJOR dim with 2 questions, MINOR dim with 1 question.
+    # (COMPLETENESS is MAJOR under taxonomy §1; INSTRUCTION_FOLLOWING / format_compliance is MINOR.)
     return [
         make_question("fc1", Dimension.FACTUAL_CONSISTENCY),
         make_question("fc2", Dimension.FACTUAL_CONSISTENCY),
-        make_question("cp1", Dimension.COMPLETENESS),
+        make_question("cp1", Dimension.INSTRUCTION_FOLLOWING),
     ]
 
 
@@ -32,7 +33,7 @@ def test_tier_weighted_average():
     rubric = _clean_rubric()
     verdicts = [make_verdict("fc1", 1), make_verdict("fc2", 0), make_verdict("cp1", 1)]
     score = aggregate(verdicts, rubric, default_weight_config())
-    # factual = 0.5, completeness = 1.0 -> 2/3*0.5 + 1/3*1.0
+    # factual = 0.5 (MAJOR), format_compliance = 1.0 (MINOR) -> 2/3*0.5 + 1/3*1.0
     assert math.isclose(score.overall, 2 / 3 * 0.5 + 1 / 3 * 1.0, abs_tol=1e-9)
     assert not score.failed
 

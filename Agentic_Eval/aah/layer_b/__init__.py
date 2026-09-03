@@ -2,14 +2,14 @@
 
 from .lessons import dedup_and_prune
 from .orchestrator import optimize
-from .results import IterationRecord, OptimizationResult
+from .loop_results import IterationRecord, OptimizationResult
 from .rubric_critic import (
     RubricCritic,
     StubRubricCritic,
     critic_collector,
     defect_objective,
 )
-from .signals import Failure, collect_failures
+from .failure_signals import Failure, collect_failures
 
 __all__ = [
     "optimize",
