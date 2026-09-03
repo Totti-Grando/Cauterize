@@ -229,6 +229,20 @@ class LocalNli:
         for claim, score in best.items():
             self._score_cache[(claim, ctx_h)] = round(score, 4)
 
+    def entail_pairs(self, pairs: Sequence[tuple[str, str]]) -> list[float]:
+        """Entailment probability for arbitrary (premise, hypothesis) pairs, batched.
+
+        The primitive for retrieve-then-verify: score (candidate_chunk, claim) pairs — including
+        pairs from *different* claims in one batch, so a rank-parallel short-circuit stays efficient."""
+        if not pairs:
+            return []
+        backend = self._get_backend()
+        out: list[float] = []
+        bs = self.cfg.batch_size
+        for i in range(0, len(pairs), bs):
+            out.extend(backend.predict(list(pairs[i:i + bs]), self.cfg.max_length))
+        return out
+
     def score(self, claim: str, context: str) -> float:
         """Graded entailment of ``claim`` by the best-supporting chunk of ``context`` (0..1)."""
         if not claim.strip() or not (context or "").strip():
