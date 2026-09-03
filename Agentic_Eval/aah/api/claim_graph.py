@@ -384,6 +384,8 @@ _HTML_TEMPLATE = r"""<!doctype html>
     <div class="sub" id="src"></div>
     <div id="summary"></div>
     <select class="sel" id="pick"></select>
+    <label style="display:flex;align-items:center;gap:8px;font-size:12px;margin:2px 0 10px;cursor:pointer">
+      <input type="checkbox" id="showIdle"/> show idle dimensions</label>
     <div id="estats"></div>
     <div class="leg" id="legend"></div>
   </div>
@@ -395,6 +397,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
 </div>
 <script>
 const PAYLOAD = __PAYLOAD__;
+let SHOW_IDLE=false, CUR=0;                 // hide unexercised dimensions by default
 const NS="http://www.w3.org/2000/svg", NW=210, NH=62;
 const TYPE={question:"#3b82f6",requirement:"#8b5cf6",claim:"#0ea5e9",check:"#64748b",source:"#10b981",dimension:"#f59e0b"};
 const STATE={pass:"#22c55e",fail:"#ef4444",abstain:"#eab308"};
@@ -426,8 +429,14 @@ function tip(html,x,y){const t=$("tip");if(!html){t.style.display="none";return;
 
 function draw(g){
   const view=$("view"); view.innerHTML="";
-  const pos={}; g.nodes.forEach(n=>pos[n.id]=n);
-  // edges first
+  // visibility: hide unexercised dimension nodes unless the toggle is on
+  const vis=g.nodes.filter(n=>SHOW_IDLE||!(n.type==="dimension"&&n.exercised===false));
+  // recompute the dimension column y among visible dims — compact but keep the category bands
+  const Y={}; vis.forEach(n=>Y[n.id]=n.y);
+  const dims=vis.filter(n=>n.type==="dimension").sort((a,b)=>a.y-b.y);
+  {let y=60,pc=null;dims.forEach(n=>{const c=n.category||"~";if(pc!==null&&c!==pc)y+=40;pc=c;Y[n.id]=y;y+=96;});}
+  const pos={}; vis.forEach(n=>pos[n.id]={x:n.x,y:Y[n.id]});
+  // edges first (skip any whose endpoint is hidden)
   g.edges.forEach(e=>{
     const a=pos[e.source],b=pos[e.target]; if(!a||!b)return;
     const x1=a.x+NW,y1=a.y+NH/2,x2=b.x,y2=b.y+NH/2;
@@ -440,8 +449,8 @@ function draw(g){
     view.appendChild(p);
   });
   // nodes
-  g.nodes.forEach(n=>{
-    const grp=el("g",{class:"node"+(n.orphan?" orphan":""),transform:`translate(${n.x},${n.y})`});
+  vis.forEach(n=>{
+    const grp=el("g",{class:"node"+(n.orphan?" orphan":""),transform:`translate(${n.x},${Y[n.id]})`});
     const fill=TYPE[n.type]||"#334155";
     const r=el("rect",{width:NW,height:NH,rx:10,ry:10,fill:fill+"22",
       stroke:n.orphan?"#ef4444":(n.gate?"#f59e0b":fill),"stroke-width":n.gate?2.4:1.5});
@@ -469,18 +478,18 @@ function draw(g){
     grp.addEventListener("mouseleave",()=>tip(null));
     view.appendChild(grp);
   });
-  fit(g);
+  fit(vis,Y);
 }
 let vx=0,vy=0,vs=1;
 function apply(){$("view").setAttribute("transform",`translate(${vx},${vy}) scale(${vs})`);}
-function fit(g){
-  const xs=g.nodes.map(n=>n.x),ys=g.nodes.map(n=>n.y);
+function fit(vis,Y){
+  const xs=vis.map(n=>n.x),ys=vis.map(n=>Y[n.id]);
   if(!xs.length){vx=0;vy=0;vs=1;apply();return;}
   const w=$("main").clientWidth,h=$("main").clientHeight;
   const maxx=Math.max(...xs)+NW+40,maxy=Math.max(...ys)+NH+40,minx=Math.min(...xs)-20,miny=Math.min(...ys)-20;
   vs=Math.min(1,Math.min(w/(maxx-minx),h/(maxy-miny)));vx=-minx*vs+10;vy=-miny*vs+10;apply();
 }
-function pick(i){draw(PAYLOAD.graphs[i]);
+function pick(i){CUR=i;draw(PAYLOAD.graphs[i]);
   const g=PAYLOAD.graphs[i],s=g.stats;
   $("estats").innerHTML=`<div class="stat"><span>verdict</span><b>${g.verdict||"—"}</b></div>`+
     (g.gatedBy?`<div class="stat"><span>gated by</span><b>${g.gatedBy}</b></div>`:"")+
@@ -495,6 +504,8 @@ function init(){
   PAYLOAD.graphs.forEach((g,i)=>{const o=document.createElement("option");o.value=i;
     o.textContent=`${g.evaluationId} — ${g.verdict||"?"}${g.stats.orphans?"  ⚠"+g.stats.orphans+" orphan":""}`;sel.appendChild(o);});
   sel.addEventListener("change",e=>pick(+e.target.value));
+  $("showIdle").checked=SHOW_IDLE;
+  $("showIdle").addEventListener("change",e=>{SHOW_IDLE=e.target.checked;pick(CUR);});
   const svg=$("svg");
   svg.addEventListener("wheel",e=>{e.preventDefault();const f=e.deltaY<0?1.1:0.9;
     const r=svg.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;

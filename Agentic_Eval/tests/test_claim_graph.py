@@ -232,6 +232,7 @@ def test_render_html_is_self_contained_and_filled():
     assert "__PAYLOAD__" not in html and "__TITLE__" not in html
     assert '"graphs"' in html  # data embedded
     assert "http://" not in html.split("PAYLOAD")[0]  # no external asset before data
+    assert 'id="showIdle"' in html and "SHOW_IDLE=false" in html  # idle-dimension toggle, default off
 
 
 def test_builds_on_real_offline_fixtures():
