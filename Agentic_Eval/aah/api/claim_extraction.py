@@ -75,6 +75,16 @@ def _split_sentences(text: str) -> list[str]:
     return [p.strip() for p in parts if len(p.strip()) > 3]
 
 
+def _has_salient(text: str) -> bool:
+    """A factual assertion usually carries a number or a proper noun; a throwaway aside doesn't.
+    Used so the stub doesn't mistake a paraphrased fact for an orphan just because it overlaps the
+    sources lexically-poorly."""
+    if re.search(r"\d", text):
+        return True
+    words = text.split()
+    return any(w[:1].isupper() for w in words[1:])       # a capitalized word after the first
+
+
 # --- extractors ---------------------------------------------------------------------
 class StubClaimExtractor:
     """Deterministic, model-free extraction: sentence-split + connective/overlap heuristics.
@@ -95,8 +105,9 @@ class StubClaimExtractor:
                 steps = [s.strip() for s in re.split(r",|;|\band\b|\bbecause\b|\bso\b", sent) if len(s.strip()) > 8]
                 parents = [ClaimParent(pid) for pid in anchored_ids[-2:]]  # lean on the last couple of facts
                 claims.append(ExtractedClaim(cid, sent, "derived", parents, steps or [sent]))
-            elif not _citations(sent) and _overlap(sent, context) < 0.2 and _overlap(sent, question) < 0.2:
-                # no citation and unrelated to both the question and the sources -> a floating aside
+            elif (not _citations(sent) and not _has_salient(sent)
+                  and _overlap(sent, context) < 0.2 and _overlap(sent, question) < 0.2):
+                # no citation, no number/proper-noun, unrelated to question AND sources -> floating aside
                 claims.append(ExtractedClaim(cid, sent, "orphan"))
             else:
                 # a plain assertion, or one that cites a source (anchored even if unsupported)
@@ -219,6 +230,16 @@ _CITE_RES = [re.compile(p, re.I) for p in (
 _URL_RE = re.compile(r"https?://\S+", re.I)
 
 
+def _strip_citations(text: str) -> str:
+    """Remove attribution phrases/URLs so grounding judges the FACT, not the 'X said it' clause.
+    (Attribution is scored separately against the cited source.)"""
+    out = text or ""
+    for rx in _CITE_RES:
+        out = rx.sub(" ", out)
+    out = _URL_RE.sub(" ", out)
+    return re.sub(r"\s+", " ", out).strip(" ,.;:")
+
+
 def _citations(text: str) -> list[str]:
     """Extract explicit source references from a claim (attribution phrases, doc types, URLs)."""
     refs: list[str] = []
@@ -299,6 +320,88 @@ async def build_claim_nodes(
                 node.reasoning_fidelity = await reasoning(c.reasoning_steps, context)
         nodes[c.id] = node
 
+    return score_tree(nodes)
+
+
+# --- retrieve-then-verify binding (hybrid retrieval + short-circuit NLI) -------------
+async def build_claim_nodes_retrieval(
+    extracted: Sequence[ExtractedClaim], *, context: str = "",
+    sources: Optional[Sequence[dict]] = None, question: str = "",
+    evidence: Optional[Sequence[dict]] = None, entail_fn=None, retriever=None,
+    k: int = 8, tau: float = 0.5, cfg: Any = None,
+) -> dict[str, ClaimNode]:
+    """Bind grounding + attribution via hybrid retrieve-then-verify, then score the tree.
+
+    Grounding = retrieve top-k over ALL sources → NLI best-first with a τ short-circuit. Attribution =
+    the same, but scoped to the CITED source (so a real-but-wrong cited source scores low, and a
+    fabricated citation → 0). Reasoning fidelity = grounding of a derived claim's steps. Runs the
+    (sync, heavy) retrieval+NLI work in a threadpool. ``entail_fn``/``retriever`` are injectable for
+    tests; defaults are ``LocalNli.entail_pairs`` + ``HybridRetriever(BM25 + spaCy)``.
+    """
+    import asyncio as _asyncio
+
+    from .claim_retrieval import (HybridRetriever, InMemoryBM25, Source, SpacyDenseRetriever,
+                                  chunk_sources, match_source, to_sources, verify_grounding)
+
+    srcs: list[Source] = to_sources(context, sources)
+    evidence = list(evidence or [])
+    non_orphan = [c for c in extracted if c.kind != "orphan"]
+
+    if entail_fn is None:
+        from .local_nli import get_local_nli
+        entail_fn = get_local_nli(cfg).entail_pairs
+
+    # grounding judges the FACT, so strip the citation clause first (attribution scores the source)
+    fact = {c.id: (_strip_citations(c.text) or c.text) for c in non_orphan}
+
+    def _work():
+        r = retriever
+        if r is None:
+            r = HybridRetriever(lexical=InMemoryBM25(), dense=SpacyDenseRetriever())
+        r.index(chunk_sources(srcs))
+
+        uniq = list({fact[c.id] for c in non_orphan})
+        grounded = verify_grounding(uniq, r, entail_fn, k=k, tau=tau) if uniq else {}
+
+        attribution: dict[str, Optional[float]] = {}
+        reasoning: dict[str, Optional[float]] = {}
+        for c in non_orphan:
+            refs = _citations(c.text)
+            if not refs or not srcs:
+                attribution[c.id] = None
+            else:
+                per_ref = []
+                for ref in refs:
+                    sid = match_source(ref, srcs)
+                    if sid is None:
+                        per_ref.append(0.0)                       # fabricated citation
+                    else:                                          # does the CITED source support the fact?
+                        res = verify_grounding([fact[c.id]], r, entail_fn, k=k, tau=tau,
+                                               source_of={fact[c.id]: sid})
+                        per_ref.append(res[fact[c.id]]["score"])
+                attribution[c.id] = round(min(per_ref), 4) if per_ref else None
+            if c.kind == "derived" and c.reasoning_steps:
+                rg = verify_grounding(list(c.reasoning_steps), r, entail_fn, k=k, tau=tau)
+                vals = [rg[s]["score"] for s in c.reasoning_steps if s in rg]
+                reasoning[c.id] = round(sum(vals) / len(vals), 4) if vals else None
+        return grounded, attribution, reasoning
+
+    grounded, attribution, reasoning = await _asyncio.to_thread(_work)
+
+    nodes: dict[str, ClaimNode] = {}
+    for c in extracted:
+        node = ClaimNode(id=c.id, text=c.text, kind=c.kind,
+                         parents=[ParentLink(p.parent_id, p.load_bearing, p.or_group) for p in c.parents])
+        if c.kind == "orphan":
+            node.relevance = round(_overlap(c.text, question), 4) if question else 0.3
+        else:
+            g = grounded.get(fact[c.id])
+            node.groundedness = g["score"] if g else 0.0
+            node.source_attribution = attribution.get(c.id)
+            node.source_quality = _quality_from_evidence(c.text, evidence)
+            if c.kind == "derived":
+                node.reasoning_fidelity = reasoning.get(c.id)
+        nodes[c.id] = node
     return score_tree(nodes)
 
 

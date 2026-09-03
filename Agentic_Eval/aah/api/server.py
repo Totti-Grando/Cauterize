@@ -320,10 +320,11 @@ def get_claim_tree_html() -> Response:
 class ClaimTreeBody(BaseModel):
     response: str                                   # the model answer to decompose
     question: Optional[str] = ""
-    context: Optional[str] = ""                     # the source documents to score claims against
+    context: Optional[str] = ""                     # source docs as one blob (fallback if no `sources`)
+    sources: Optional[list[dict]] = None            # per-source [{id, text, title}] for attribution scope
     evidence: Optional[list[dict]] = None
     extract: Optional[str] = "stub"                 # stub (offline) | llm (Groq)
-    grounding: Optional[str] = "deterministic"      # deterministic | local (transformer NLI) | llm
+    grounding: Optional[str] = "deterministic"      # deterministic | local | llm | retrieval
 
 
 @app.post("/api/claim-tree/extract")
@@ -331,24 +332,36 @@ async def extract_claim_tree(body: ClaimTreeBody) -> dict:
     """Extract a scored claim DAG from a real answer + source context.
 
     ``extract``: how claims are decomposed — ``stub`` (offline heuristics) or ``llm`` (Groq).
-    ``grounding``: how each claim's truthfulness is scored against the source context —
-    ``deterministic`` (overlap), ``local`` (the dedicated transformer NLI model, no API), or ``llm``
-    (Groq NLI). Unavailable options degrade gracefully to deterministic.
+    ``grounding``: how each claim's truthfulness is scored —
+    ``retrieval`` (hybrid BM25+spaCy retrieve-then-verify with the local DeBERTa NLI — recommended,
+    scales + catches paraphrase + upgrades attribution to the cited source), ``local`` (NLI over the
+    whole context, no retrieval), ``deterministic`` (overlap), or ``llm`` (Groq NLI). Unavailable
+    options degrade gracefully to deterministic. ``sources`` (per-source ``{id,text,title}``) enables
+    the attribution scope; without it the ``context`` blob is treated as one source.
     """
     from ..model_clients import (AsyncGroqClient, DEFAULT_GROQ_EVAL_MODEL,
                                   DEFAULT_GROQ_TARGET_MODEL, resolve_groq_key)
     from .claim_extraction import (LlmClaimExtractor, StubClaimExtractor, build_claim_nodes,
-                                   live_scorers, local_scorers, prewarm_grounding)
+                                   build_claim_nodes_retrieval, live_scorers, local_scorers,
+                                   prewarm_grounding)
 
     q, resp, ctx = body.question or "", body.response, body.context or ""
     client = AsyncGroqClient(resolve_groq_key()) if resolve_groq_key() else None
 
+    # give the extractor the full source text (blob or per-source) so its classification isn't blind
+    extract_ctx = ctx or " ".join(str(s.get("text") or "") for s in (body.sources or []))
     extractor = (LlmClaimExtractor(client=client, model=DEFAULT_GROQ_EVAL_MODEL)
                  if body.extract == "llm" and client else StubClaimExtractor())
-    claims = await extractor.extract(q, resp, ctx)
+    claims = await extractor.extract(q, resp, extract_ctx)
+    ex = "llm" if isinstance(extractor, LlmClaimExtractor) else "stub"
+
+    grounding = body.grounding
+    if grounding == "retrieval":
+        tree = await build_claim_nodes_retrieval(claims, context=ctx, sources=body.sources,
+                                                 question=q, evidence=body.evidence)
+        return claim_scoring.to_graph(tree, source=f"extract:{ex}/ground:retrieval")
 
     sc: dict[str, Any] = {}
-    grounding = body.grounding
     if grounding == "local":
         sc = local_scorers()
         await prewarm_grounding(claims, ctx)                 # batched pre-scoring -> cache hits
@@ -360,8 +373,7 @@ async def extract_claim_tree(body: ClaimTreeBody) -> dict:
     tree = await build_claim_nodes(claims, response=resp, context=ctx, question=q,
                                    evidence=body.evidence, grounded=sc.get("grounded"),
                                    attribution=sc.get("attribution"), reasoning=sc.get("reasoning"))
-    src = f"extract:{'llm' if isinstance(extractor, LlmClaimExtractor) else 'stub'}/ground:{grounding}"
-    return claim_scoring.to_graph(tree, source=src)
+    return claim_scoring.to_graph(tree, source=f"extract:{ex}/ground:{grounding}")
 
 
 # --- streaming mode flows (SSE) -----------------------------------------------------

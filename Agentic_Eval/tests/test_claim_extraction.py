@@ -141,6 +141,33 @@ def test_attribution_none_when_no_citation_or_no_evidence():
     assert _attribution("per the Q3 filing", []) is None                      # no source set -> N/A
 
 
+def test_retrieval_binding_grounds_and_catches_wrong_real_source():
+    from aah.api.claim_extraction import build_claim_nodes_retrieval
+    from aah.api.claim_retrieval import HybridRetriever, InMemoryBM25
+
+    sources = [
+        {"id": "filing", "text": "Q3 revenue was 4.2 billion dollars this quarter", "title": "Q3 filing"},
+        {"id": "news", "text": "the company mascot is a penguin", "title": "Newswire report"},
+    ]
+    claims = [
+        ExtractedClaim("c0", "revenue was 4.2 billion according to the Q3 filing", "anchored"),
+        # cites a REAL source that exists in the set (Newswire) but is the WRONG one for this fact
+        ExtractedClaim("c1", "revenue was 4.2 billion according to the Newswire report", "anchored"),
+    ]
+
+    def entail_fn(pairs):                       # 'grounded' iff the premise states revenue+billion
+        return [1.0 if ("revenue" in p and "billion" in p) else 0.0 for p, _h in pairs]
+
+    retr = HybridRetriever(lexical=InMemoryBM25(), dense=None)   # BM25-only -> no model needed
+    tree = _run(build_claim_nodes_retrieval(claims, sources=sources, retriever=retr, entail_fn=entail_fn))
+
+    assert tree["c0"].groundedness == 1.0 and tree["c0"].source_attribution == 1.0   # correct source
+    # c1 is grounded (the fact IS in the corpus) but its CITED source doesn't support it -> attr low
+    assert tree["c1"].groundedness == 1.0
+    assert tree["c1"].source_attribution == 0.0        # real-but-wrong cited source caught
+    assert tree["c1"].own_truthfulness == 0.0          # attribution drags min to 0
+
+
 def test_fabricated_citation_drags_claim_score_via_min():
     async def go():
         claims = [ExtractedClaim("c0", "Profits tripled according to the Bloomberg terminal", "anchored")]
