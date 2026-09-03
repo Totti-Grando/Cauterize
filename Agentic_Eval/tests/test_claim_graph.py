@@ -185,6 +185,46 @@ def test_adapter_carries_category_and_subtype_from_config():
     assert checks and all("category" in c and "subtype" in c and "subtype_gates" in c for c in checks)
 
 
+def test_all_configured_dimensions_render_even_when_no_check_touches_them():
+    # the graph must show the FULL evaluation configuration, not only dimensions a check exercised
+    ev = _eval(
+        perDimension=[
+            {"dimension": "factual_consistency", "category": "evidence_truthfulness",
+             "tier": "major", "gating": False, "score": 0.5, "weight": 2.0},
+            {"dimension": "toxicity", "category": "safety", "tier": "major", "gating": False,
+             "score": 1.0, "weight": 1.0},
+            {"dimension": "clarity", "category": "communication", "tier": "minor", "gating": False,
+             "score": 0.8, "weight": 1.0},
+        ],
+        rubric=[{"requirement": "R", "checks": [
+            {"id": "c0", "text": "grounded", "dimension": "factual_consistency",
+             "category": "evidence_truthfulness", "tier": "major", "score": 1, "reason": "ok"},
+        ]}])
+    g = cg.build_evaluation_graph(ev)
+    dims = {n["dimension"] for n in g["nodes"] if n["type"] == "dimension"}
+    assert dims == {"factual_consistency", "toxicity", "clarity"}        # all 3 configured dims appear
+    # the dimension a check scored is 'exercised'; the untouched ones are not
+    by_dim = {n["dimension"]: n for n in g["nodes"] if n["type"] == "dimension"}
+    assert by_dim["factual_consistency"]["exercised"] is True
+    assert by_dim["toxicity"]["exercised"] is False and by_dim["clarity"]["exercised"] is False
+
+
+def test_dimension_lane_is_banded_by_category():
+    ev = _eval(perDimension=[
+        {"dimension": "clarity", "category": "communication", "tier": "minor", "score": 1, "weight": 1},
+        {"dimension": "factual_consistency", "category": "evidence_truthfulness", "tier": "major", "score": 1, "weight": 1},
+        {"dimension": "structure", "category": "communication", "tier": "minor", "score": 1, "weight": 1},
+        {"dimension": "source_quality", "category": "evidence_truthfulness", "tier": "major", "score": 1, "weight": 1},
+    ])
+    g = cg.build_evaluation_graph(ev)
+    dim_nodes = sorted([n for n in g["nodes"] if n["type"] == "dimension"], key=lambda n: n["y"])
+    cats = [n["category"] for n in dim_nodes]
+    # each category is contiguous (no category split across two bands)
+    transitions = sum(1 for a, b in zip(cats, cats[1:]) if a != b)
+    assert transitions == len(set(cats)) - 1
+    assert len(dim_nodes) == 4
+
+
 def test_render_html_is_self_contained_and_filled():
     payload = cg.build_graph([_eval()])
     html = cg.render_html(payload, title="X")

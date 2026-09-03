@@ -65,6 +65,7 @@ _LAYER = {"question": 0, "requirement": 1, "claim": 2, "check": 2, "source": 3, 
 _COL_W = 260
 _ROW_H = 96
 _ORPHAN_GAP = 60          # vertical gap before the orphan band within a column
+_CAT_GAP = 40             # vertical gap between taxonomy-category bands in the dimension column
 
 
 def _state(score: Any) -> str:
@@ -145,6 +146,19 @@ def build_evaluation_graph(ev: dict, prefix: str = "") -> dict:
         if n["type"] == "source" and n.get("fetch_success") and (n.get("support") in _SUPPORTING)
     ]
 
+    # --- dimension lane: EVERY configured dimension (the run's full per-dimension breakdown), so the
+    # graph reflects the complete evaluation configuration — not only dimensions a check happened to
+    # touch. Dimensions no check scores simply carry no scored_in edge (``exercised=False``). --------
+    for d in ev.get("perDimension", []) or []:
+        dname = d.get("dimension")
+        if not dname:
+            continue
+        add_node(
+            p + "dim:" + dname, type="dimension", label=dname.replace("_", " "),
+            dimension=dname, category=d.get("category"), tier=d.get("tier"),
+            gating=dname in gating_dims, score=d.get("score"), weight=d.get("weight"),
+        )
+
     # --- requirements → checks/claims ----------------------------------------------
     for gi, group in enumerate(ev.get("rubric", []) or []):
         req_text = (group.get("requirement") or "").strip()
@@ -218,6 +232,12 @@ def build_evaluation_graph(ev: dict, prefix: str = "") -> dict:
                       else "source grounds no claim in this answer")
             n["orphan"], n["orphan_reason"] = True, reason
 
+    # mark which configured dimensions an actual check scored (the rest are configured-but-untouched)
+    scored_dims = {e["target"] for e in edges if e["kind"] == "scored_in"}
+    for n in nodes:
+        if n["type"] == "dimension":
+            n["exercised"] = n["id"] in scored_dims
+
     _layout(nodes)
     stats = _stats(nodes, edges)
     return {
@@ -258,20 +278,31 @@ def _get(nodes: list[dict], node_id: str) -> dict:
 
 
 def _layout(nodes: list[dict]) -> None:
-    """Assign (x, y) by type-column, with orphan nodes pushed into a lower band per column."""
+    """Assign (x, y) by type-column. Orphan nodes are pushed into a lower band per column; dimension
+    nodes are ordered and banded by their taxonomy category (a gap between category groups) so the
+    dimension lane reads as the grouped evaluation configuration."""
     by_layer: dict[int, list[dict]] = {}
     for n in nodes:
         by_layer.setdefault(_LAYER.get(n["type"], 2), []).append(n)
     for layer, group in by_layer.items():
-        # non-orphans first (stable), then a gap, then orphans — so orphans cluster at the bottom.
-        group.sort(key=lambda n: (bool(n.get("orphan")), n["id"]))
+        # non-orphans first (stable), then a gap, then orphans; dimensions additionally group by
+        # category (other node types keep their original id ordering — empty category key).
+        group.sort(key=lambda n: (bool(n.get("orphan")),
+                                  (n.get("category") or "~") if n["type"] == "dimension" else "",
+                                  n["id"]))
         x = 80 + layer * _COL_W
         y = 60
         prev_orphan = False
+        prev_cat: Optional[str] = None
         for n in group:
             if n.get("orphan") and not prev_orphan:
                 y += _ORPHAN_GAP        # visual break between main nodes and the orphan band
                 prev_orphan = True
+            if n["type"] == "dimension":
+                cat = n.get("category") or "~"
+                if prev_cat is not None and cat != prev_cat:
+                    y += _CAT_GAP       # visual break between taxonomy-category bands
+                prev_cat = cat
             n["x"], n["y"] = x, y
             y += _ROW_H
 
@@ -418,7 +449,7 @@ function draw(g){
     const label=el("text",{x:12,y:22,class:"lbl"}); label.textContent=n.label||n.id; grp.appendChild(label);
     const meta=el("text",{x:12,y:40,class:"meta"});
     meta.textContent=(n.type==="claim"||n.type==="check")?((n.dimension||"")+" · "+(n.tier||"")):
-      (n.type==="source"?("support: "+(n.support||"n/a")):(n.type==="dimension"?("tier: "+(n.tier||"?")):n.type));
+      (n.type==="source"?("support: "+(n.support||"n/a")):(n.type==="dimension"?((n.category?n.category+" · ":"")+"tier: "+(n.tier||"?")+(n.exercised===false?" · idle":"")):n.type));
     grp.appendChild(meta);
     // state dot
     if(n.state){grp.appendChild(el("circle",{cx:NW-14,cy:16,r:5,fill:STATE[n.state]||"#64748b"}));}
