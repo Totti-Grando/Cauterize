@@ -132,6 +132,59 @@ def test_layout_positions_every_node_and_bands_orphans_lower():
     assert orphan["x"] == healthy["x"] and orphan["y"] > healthy["y"]
 
 
+def test_claim_classification_is_category_driven_not_hardcoded():
+    # a check in an evidence/RAG category is a grounding CLAIM even when its dimension NAME is unknown
+    # to the graph — classification follows the config-carried category, not a frozen name list.
+    ev = _eval(rubric=[{"requirement": "R", "checks": [
+        {"id": "c0", "text": "novel rag dim", "dimension": "some_future_rag_dim",
+         "category": "rag_quality", "tier": "major", "score": 1, "reason": "ok"},
+        {"id": "c1", "text": "a quality check", "dimension": "answer_correctness",
+         "category": "response_quality", "tier": "major", "score": 1, "reason": "ok"},
+    ]}])
+    g = cg.build_evaluation_graph(ev)
+    by_dim = {n.get("dimension"): n["type"] for n in g["nodes"] if n["type"] in ("claim", "check")}
+    assert by_dim["some_future_rag_dim"] == "claim"       # rag_quality category -> claim
+    assert by_dim["answer_correctness"] == "check"        # response_quality category -> plain check
+
+
+def test_legacy_record_without_category_falls_back_to_dim_names():
+    # a record predating the category field still classifies via the fallback dimension set
+    ev = _eval(rubric=[{"requirement": "R", "checks": [
+        {"id": "c0", "text": "grounded", "dimension": "factual_consistency",
+         "tier": "major", "score": 1, "reason": "ok"},          # no 'category' key
+    ]}])
+    g = cg.build_evaluation_graph(ev)
+    assert next(n for n in g["nodes"] if n["id"].endswith("c:c0"))["type"] == "claim"
+
+
+def test_subtype_gated_check_is_an_and_gate():
+    # a scored (MAJOR, non-must-pass) check whose failure subtype gates the run — from the run config,
+    # NOT a critical tier or must_pass — must still be rendered as an AND gate.
+    ev = _eval(
+        perDimension=[{"dimension": "source_fabrication", "tier": "major", "gating": False,
+                       "category": "evidence_truthfulness", "score": 0.0, "weight": 2.0}],
+        rubric=[{"requirement": "No fabricated sources", "checks": [
+            {"id": "c0", "text": "cited source exists", "dimension": "source_fabrication",
+             "category": "evidence_truthfulness", "subtype": "fabricated_source", "tier": "major",
+             "must_pass": False, "subtype_gates": True, "score": 0, "reason": "fabricated"},
+        ]}])
+    g = cg.build_evaluation_graph(ev)
+    gate = next(n for n in g["nodes"] if n.get("gate"))
+    assert gate["subtype_gates"] is True and gate["must_pass"] is False and gate["tier"] == "major"
+    assert any(e["kind"] == "gates" and e.get("failed") for e in g["edges"])
+
+
+def test_adapter_carries_category_and_subtype_from_config():
+    # the whole point: the graph's config comes from the adapter, so the adapter must emit category +
+    # subtype + subtype_gates on real fixtures.
+    pairs = asyncio.run(run_scenario())
+    evals = [audit_to_evaluation(rec, case_meta(case, "test")) for case, rec in pairs]
+    dims = [d for ev in evals for d in ev["perDimension"]]
+    checks = [c for ev in evals for grp in ev["rubric"] for c in grp["checks"]]
+    assert dims and all("category" in d for d in dims)
+    assert checks and all("category" in c and "subtype" in c and "subtype_gates" in c for c in checks)
+
+
 def test_render_html_is_self_contained_and_filled():
     payload = cg.build_graph([_eval()])
     html = cg.render_html(payload, title="X")

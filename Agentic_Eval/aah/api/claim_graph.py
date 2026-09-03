@@ -35,13 +35,26 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Optional
 
-# Dimensions whose checks are grounding claims (assertions entailed by a retrieved source).
-# Evidence & Truthfulness + RAG-quality families (enums.py). A failing/abstaining grounding claim
-# with no supporting source is an orphan (an unsupported claim) — the core faithfulness signal.
-GROUNDING_DIMS = frozenset({
+# A check is a grounding *claim* (an assertion to be entailed by a source) when its dimension sits in
+# the Evidence & Truthfulness or RAG-Quality taxonomy category. The evaluation dict carries each
+# check's ``category`` straight from the run config (ui_adapter reads aah/config/taxonomy.py), so this
+# classification is CONFIG-DRIVEN, not a frozen name list.
+_GROUNDING_CATEGORIES = frozenset({"evidence_truthfulness", "rag_quality"})
+# Fallback for legacy records that predate the ``category`` field — the 8 grounding dimensions as of
+# taxonomy v1. Only consulted when a check carries no category.
+_GROUNDING_DIMS_FALLBACK = frozenset({
     "factual_consistency", "source_fabrication", "source_quality", "source_attribution",
     "retrieval_precision", "retrieval_recall", "context_utilization", "context_relevance",
 })
+
+
+def _is_grounding(check: dict) -> bool:
+    """Is this check a grounding claim? Driven by the taxonomy ``category`` carried in the record;
+    falls back to the legacy dimension-name set only when no category is present."""
+    cat = check.get("category")
+    if cat:
+        return cat in _GROUNDING_CATEGORIES
+    return (check.get("dimension") or "") in _GROUNDING_DIMS_FALLBACK
 
 # Support levels (from evidence records) that count as a real grounding anchor. A source with
 # any other level (or a failed fetch) can never receive a grounds-edge, so it may orphan.
@@ -65,9 +78,12 @@ def _state(score: Any) -> str:
 
 
 def _is_gate(check: dict, gating_dims: set[str]) -> bool:
-    """A check is an AND gate if it is must-pass, sits in a CRITICAL/gating dimension, or its
-    tier is critical. Any one of these can veto the whole run (spec §7.4 / aggregator)."""
+    """A check is an AND gate if it is must-pass, its failure subtype gates its (scored) dimension,
+    it sits in a CRITICAL/gating dimension, or its tier is critical. Any one of these can veto the
+    whole run (spec §7.4 / taxonomy §1 gating subtypes / aggregator)."""
     if check.get("must_pass"):
+        return True
+    if check.get("subtype_gates"):                       # scored dim vetoing on this failure subtype
         return True
     if (check.get("tier") or "").lower() == "critical":
         return True
@@ -144,15 +160,17 @@ def build_evaluation_graph(ev: dict, prefix: str = "") -> dict:
 
         for check in group.get("checks", []) or []:
             dim = check.get("dimension") or ""
-            is_claim = dim in GROUNDING_DIMS
+            is_claim = _is_grounding(check)
             state = _state(check.get("score"))
             gate = _is_gate(check, gating_dims)
             cid = add_node(
                 p + "c:" + str(check.get("id") or f"{gi}-{len(nodes)}"),
                 type="claim" if is_claim else "check",
                 label=_short(check.get("text") or check.get("id") or "check", 60),
-                full=check.get("text") or "", dimension=dim, tier=check.get("tier"),
+                full=check.get("text") or "", dimension=dim, category=check.get("category"),
+                subtype=check.get("subtype"), tier=check.get("tier"),
                 eval_method=check.get("eval_method"), must_pass=bool(check.get("must_pass")),
+                subtype_gates=bool(check.get("subtype_gates")),
                 state=state, reason=_short(check.get("reason") or "", 200),
                 attack_success=check.get("attack_success"), gate=gate,
             )
@@ -165,7 +183,8 @@ def build_evaluation_graph(ev: dict, prefix: str = "") -> dict:
             if dim:
                 did = add_node(
                     p + "dim:" + dim, type="dimension", label=dim.replace("_", " "),
-                    dimension=dim, tier=(per_dim.get(dim) or {}).get("tier"),
+                    dimension=dim, category=(per_dim.get(dim) or {}).get("category"),
+                    tier=(per_dim.get(dim) or {}).get("tier"),
                     gating=dim in gating_dims,
                     score=(per_dim.get(dim) or {}).get("score"),
                     weight=(per_dim.get(dim) or {}).get("weight"),
@@ -407,13 +426,13 @@ function draw(g){
     if(n.orphan){const bo=el("text",{x:12,y:NH-8,class:"badge",fill:"#ef4444"});bo.textContent="ORPHAN";grp.appendChild(bo);}
     grp.addEventListener("mousemove",ev=>{
       let h=`<div class="t">${(n.full||n.label||"").replace(/</g,"&lt;")}</div>`;
-      h+=`<div class="k">type: ${n.type}${n.dimension?" · "+n.dimension:""}</div>`;
+      h+=`<div class="k">type: ${n.type}${n.dimension?" · "+n.dimension:""}${n.category?" · "+n.category:""}</div>`;
       if(n.state)h+=`<div>state: <b>${n.state}</b>${n.must_pass?" · must-pass":""}</div>`;
       if(n.reason)h+=`<div class="k">${n.reason.replace(/</g,"&lt;")}</div>`;
       if(n.support!=null)h+=`<div>support: ${n.support} · fetched: ${n.fetch_success}</div>`;
       if(n.quote)h+=`<div class="k">“${n.quote.replace(/</g,"&lt;")}”</div>`;
       if(n.orphan)h+=`<div style="color:#ef4444">orphan — ${n.orphan_reason||""}</div>`;
-      if(n.gate)h+=`<div style="color:#f59e0b">gate — can veto the whole run</div>`;
+      if(n.gate)h+=`<div style="color:#f59e0b">gate — ${n.subtype_gates?("vetoes on subtype: "+(n.subtype||"?")):"can veto the whole run"}</div>`;
       tip(h,ev.clientX,ev.clientY);
     });
     grp.addEventListener("mouseleave",()=>tip(null));

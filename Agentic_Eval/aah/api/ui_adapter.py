@@ -8,6 +8,7 @@ engine contracts and the engine never learns about UI wording.
 
 from __future__ import annotations
 
+from ..config.taxonomy import DIMENSION_META
 from ..contracts import AuditRecord, BinaryQuestion, Dimension, Subtype, Verdict
 
 # Engine failure subtype -> the UI's coarse shortfall tag vocabulary.
@@ -154,9 +155,13 @@ def audit_to_evaluation(record: AuditRecord, meta: dict) -> dict:
 
 
 def _rubric_breakdown(record: AuditRecord) -> list[dict]:
-    """Group the rubric by requirement, each check carrying its tier + verdict + reason."""
+    """Group the rubric by requirement, each check carrying its tier + verdict + reason, plus the
+    taxonomy ``category`` and whether the check's failure ``subtype`` gates the run under THIS run's
+    config (``weight_config.gating_subtypes``). Carrying these lets the claim graph classify and gate
+    from the actual evaluation configuration rather than a hard-coded dimension list."""
     v_by_id = {v.question_id: v for v in record.verdicts}
     tiers = record.weight_config.tiers
+    gating_subtypes = record.weight_config.gating_subtypes
     groups: list[dict] = []
     index: dict[str, int] = {}
     for q in record.rubric:
@@ -166,13 +171,18 @@ def _rubric_breakdown(record: AuditRecord) -> list[dict]:
             groups.append({"requirement": q.requirement_text or "(unspecified requirement)", "checks": []})
         v = v_by_id.get(q.id)
         tier = tiers.get(q.dimension)
+        meta = DIMENSION_META.get(q.dimension)
         groups[index[key]]["checks"].append({
             "id": q.id,
             "text": q.text,
             "dimension": q.dimension.value,
+            "category": meta.category.value if meta and meta.category else None,
+            "subtype": q.subtype.value,
             "tier": tier.value if tier else "",
             "eval_method": q.eval_method.value,
             "must_pass": q.must_pass,
+            # a scored (MAJOR/MINOR) dimension can still veto when this failure subtype is gating
+            "subtype_gates": q.subtype in gating_subtypes.get(q.dimension, frozenset()),
             "score": v.score if v else None,
             "reason": v.explanation if v else "",
             "attack_success": v.attack_success if v else None,
@@ -181,8 +191,12 @@ def _rubric_breakdown(record: AuditRecord) -> list[dict]:
 
 
 def _per_dimension(record: AuditRecord) -> list[dict]:
-    return [
-        {"dimension": d.dimension.value, "tier": d.tier.value, "gating": d.gating,
-         "score": round(d.score, 4), "weight": round(d.weight, 4)}
-        for d in record.scores.per_dimension
-    ]
+    out: list[dict] = []
+    for d in record.scores.per_dimension:
+        meta = DIMENSION_META.get(d.dimension)
+        out.append({
+            "dimension": d.dimension.value, "tier": d.tier.value, "gating": d.gating,
+            "category": meta.category.value if meta and meta.category else None,
+            "score": round(d.score, 4), "weight": round(d.weight, 4),
+        })
+    return out
