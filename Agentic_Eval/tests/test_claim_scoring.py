@@ -170,6 +170,23 @@ def test_answer_node_stems_into_base_claims():
     assert xa < xbase < xder
 
 
+def test_question_answer_spine_columns():
+    t = _tree(
+        ClaimNode(id="a", text="p", kind="anchored", groundedness=0.9, source_attribution=0.9, source_quality=0.9),
+        ClaimNode(id="d", text="c", kind="derived", groundedness=0.8, source_attribution=0.8, source_quality=0.8,
+                  reasoning_fidelity=0.9, parents=[ParentLink("a")]),
+    )
+    g = to_graph(t, question="What happened?", answer="It happened.")
+    q = next(n for n in g["nodes"] if n["type"] == "question")
+    an = next(n for n in g["nodes"] if n["type"] == "answer")
+    a = next(n for n in g["nodes"] if n["id"] == "a")
+    d = next(n for n in g["nodes"] if n["id"] == "d")
+    assert q["x"] < an["x"] < a["x"] < d["x"]            # question → answer → base → derived
+    assert any(e["kind"] == "asks" and e["source"] == q["id"] and e["target"] == an["id"] for e in g["edges"])
+    # base claims stem from the answer, not the question
+    assert all(e["source"] == an["id"] for e in g["edges"] if e["kind"] == "decomposes")
+
+
 def test_derive_edges_are_labelled_entails_or_supports():
     t = _tree(
         ClaimNode(id="a", text="p", kind="anchored", groundedness=0.9, source_attribution=0.9, source_quality=0.9),

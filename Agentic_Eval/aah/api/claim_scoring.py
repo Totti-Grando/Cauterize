@@ -194,19 +194,25 @@ def band(score: Optional[float]) -> str:
     return "red"
 
 
-def to_graph(nodes: dict[str, ClaimNode], *, source: str = "", answer: str = "") -> dict:
+def to_graph(nodes: dict[str, ClaimNode], *, source: str = "", answer: str = "",
+             question: str = "") -> dict:
     """Convert a scored claim tree into the {nodes, edges, stats} shape the renderer consumes.
 
-    ``answer`` (optional) adds a leftmost ANSWER node that the base claims (anchored + orphan) stem
-    from. Edge kinds: ``decomposes`` (answer → base claim), ``derives`` (parent → child, labelled
-    'entails' for a load-bearing premise else 'supports'), and ``sibling`` (a vertical AND / OR
-    connector between the parents that JOINTLY gate the same child — co-gating siblings only)."""
+    Optional roots build the left spine: ``question`` → ``answer`` → base claims (anchored + orphan)
+    → derived children. Edge kinds: ``asks`` (question → answer), ``decomposes`` (answer/question →
+    base claim), ``derives`` (parent → child, labelled 'entails' for a load-bearing premise else
+    'supports'), and ``sibling`` (a vertical AND / OR connector between the parents that JOINTLY gate
+    the same child — co-gating siblings only)."""
     gnodes = []
+    if question:
+        gnodes.append({
+            "id": "__question__", "type": "question", "kind": "question", "orphan": False,
+            "label": question, "full": question, "score": None, "band": "abstain",
+        })
     if answer:
         gnodes.append({
             "id": "__answer__", "type": "answer", "kind": "answer", "orphan": False,
-            "label": (answer[:90] + "…") if len(answer) > 90 else answer, "full": answer,
-            "score": None, "band": "abstain",
+            "label": answer, "full": answer, "score": None, "band": "abstain",
         })
     for n in nodes.values():
         gnodes.append({
@@ -219,10 +225,14 @@ def to_graph(nodes: dict[str, ClaimNode], *, source: str = "", answer: str = "")
             "threshold": AXIOM_THRESHOLD, "orphan": n.kind == "orphan",
         })
     gedges = []
-    if answer:
+    if question and answer:
+        gedges.append({"source": "__question__", "target": "__answer__", "kind": "asks",
+                       "relation": "asks", "load_bearing": False, "label": "answered by"})
+    stem_root = "__answer__" if answer else ("__question__" if question else None)
+    if stem_root:
         for n in nodes.values():
             if n.kind in ("anchored", "orphan"):
-                gedges.append({"source": "__answer__", "target": n.id, "kind": "decomposes",
+                gedges.append({"source": stem_root, "target": n.id, "kind": "decomposes",
                                "relation": "stem", "load_bearing": False, "label": ""})
     for n in nodes.values():
         for link in n.parents:
@@ -232,7 +242,7 @@ def to_graph(nodes: dict[str, ClaimNode], *, source: str = "", answer: str = "")
                 "load_bearing": link.load_bearing, "or_group": link.or_group,
                 "label": link.relation or ("entails" if link.load_bearing else "supports"),
             })
-    _layout(gnodes, gedges, has_answer=bool(answer))
+    _layout(gnodes, gedges, has_answer=bool(answer), has_question=bool(question))
     gedges.extend(_sibling_edges(nodes, gnodes))       # vertical AND/OR after positions are known
     stats = {
         "nodes": len(gnodes), "edges": len(gedges),
@@ -242,8 +252,8 @@ def to_graph(nodes: dict[str, ClaimNode], *, source: str = "", answer: str = "")
         "bands": {b: sum(1 for n in nodes.values() if band(n.score) == b)
                   for b in ("green", "amber", "red", "abstain")},
     }
-    return {"source": source, "answer": answer, "nodes": gnodes, "edges": gedges, "stats": stats,
-            "axiom_threshold": AXIOM_THRESHOLD}
+    return {"source": source, "question": question, "answer": answer, "nodes": gnodes,
+            "edges": gedges, "stats": stats, "axiom_threshold": AXIOM_THRESHOLD}
 
 
 def _sibling_edges(nodes: dict[str, ClaimNode], gnodes: list[dict]) -> list[dict]:
@@ -283,13 +293,16 @@ def _sibling_edges(nodes: dict[str, ClaimNode], gnodes: list[dict]) -> list[dict
     return out
 
 
-# --- DAG layout: answer → base claims (anchored/orphan) → derived children ----------
-_COL_W, _ROW_H = 300, 104
+# --- DAG layout: question → answer → base claims (anchored/orphan) → derived children ----------
+_COL_W, _ROW_H = 300, 116
 
 
-def _layout(gnodes: list[dict], gedges: list[dict], *, has_answer: bool = False) -> None:
-    """Column by longest DERIVE depth (base claims=0), shifted right by one when an answer node is
-    present. The answer sits leftmost, vertically centered on the base column."""
+def _layout(gnodes: list[dict], gedges: list[dict], *, has_answer: bool = False,
+            has_question: bool = False) -> None:
+    """Column by longest DERIVE depth (base claims = 0), shifted right by the left-spine roots
+    (question, answer). To read like a tree, each derived child is centered on the mean y of its
+    load-bearing parents (then de-overlapped within its column); the answer/question sit leftmost,
+    centered on the base column."""
     parents_of: dict[str, list[str]] = {n["id"]: [] for n in gnodes}
     for e in gedges:
         if e["kind"] == "derives" and e["target"] in parents_of:
@@ -306,24 +319,46 @@ def _layout(gnodes: list[dict], gedges: list[dict], *, has_answer: bool = False)
         depth[nid] = val
         return val
 
-    claim_nodes = [n for n in gnodes if n["type"] != "answer"]
+    claim_nodes = [n for n in gnodes if n["type"] not in ("answer", "question")]
     for n in claim_nodes:
         d(n["id"])
-    off = 1 if has_answer else 0
+    off = (1 if has_question else 0) + (1 if has_answer else 0)
+    pos = {n["id"]: n for n in gnodes}
     by_layer: dict[int, list[dict]] = {}
     for n in claim_nodes:
         by_layer.setdefault(depth[n["id"]], []).append(n)
-    for layer, group in by_layer.items():
-        group.sort(key=lambda n: (0 if not n.get("orphan") else 1, n["id"]))
-        for i, n in enumerate(group):
-            n["x"] = 80 + (layer + off) * _COL_W
-            n["y"] = 60 + i * _ROW_H
+    maxd = max(by_layer) if by_layer else 0
+
+    # base column (depth 0): non-orphans first, then orphans, stacked evenly
+    base = by_layer.get(0, [])
+    base.sort(key=lambda n: (1 if n.get("orphan") else 0, n["id"]))
+    for i, n in enumerate(base):
+        n["x"], n["y"] = 80 + off * _COL_W, 60 + i * _ROW_H
+
+    # deeper columns: center each child on the mean y of its load-bearing parents, de-overlap by y
+    for layer in range(1, maxd + 1):
+        grp = by_layer.get(layer, [])
+        for n in grp:
+            ys = [pos[p]["y"] for p in parents_of.get(n["id"], []) if p in pos and "y" in pos[p]]
+            n["_want"] = sum(ys) / len(ys) if ys else 60.0
+        grp.sort(key=lambda n: (n["_want"], n["id"]))
+        y = -1e9
+        for n in grp:
+            yy = max(n["_want"], y + _ROW_H)
+            n["x"], n["y"], y = 80 + (off + layer) * _COL_W, yy, yy
+        for n in grp:
+            n.pop("_want", None)
+
+    cy = (sum(n["y"] for n in base) / len(base)) if base else \
+         (sum(n["y"] for n in claim_nodes) / len(claim_nodes) if claim_nodes else 60)
     if has_answer:
-        base = by_layer.get(0, [])
-        ay = (sum(n["y"] for n in base) / len(base)) if base else 60
         for n in gnodes:
             if n["type"] == "answer":
-                n["x"], n["y"] = 80, ay
+                n["x"], n["y"] = 80 + (1 if has_question else 0) * _COL_W, cy
+    if has_question:
+        for n in gnodes:
+            if n["type"] == "question":
+                n["x"], n["y"] = 80, cy
 
 
 def demo_claim_tree() -> dict[str, ClaimNode]:
@@ -377,109 +412,151 @@ def render_html(graph: dict, title: str = "Claim Tree — nodal scoring") -> str
 _TREE_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>__TITLE__</title><style>
- :root{--bg:#0f1420;--panel:#161d2e;--line:#2a3350;--txt:#e6ebf5;--mut:#8b97b5;
-   --green:#22c55e;--amber:#eab308;--red:#ef4444;--abstain:#64748b;}
- *{box-sizing:border-box}html,body{margin:0;height:100%;font:14px/1.4 system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--txt)}
- #app{display:flex;height:100vh}#main{flex:1;position:relative;overflow:hidden}
- #panel{width:320px;flex:0 0 320px;background:var(--panel);border-left:1px solid var(--line);padding:16px;overflow:auto}
- #panel h2{font-size:14px;margin:0 0 2px}#panel .k{color:var(--mut);font-size:12px}
- .row{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px dashed var(--line);font-size:12px}
- .row b{font-weight:600}.pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:700}
- .bar{height:7px;border-radius:4px;background:#0d1322;overflow:hidden;margin-top:3px}.bar>span{display:block;height:100%}
- #hint{position:absolute;left:12px;bottom:10px;color:var(--mut);font-size:11px}
- #legend{position:absolute;left:12px;top:10px;font-size:11px;color:var(--mut);background:rgba(11,16,28,.7);padding:8px 10px;border-radius:8px;border:1px solid var(--line)}
- #legend .r{display:flex;align-items:center;gap:6px;padding:1px 0}#legend .sw{width:16px;height:10px;border-radius:3px}
+ :root{--bg:#0b0f1a;--bg2:#0f1420;--panel:#141b2b;--line:#28324e;--txt:#eef2fb;--mut:#8b97b5;
+   --green:#22c55e;--amber:#eab308;--red:#ef4444;--abstain:#64748b;--q:#a78bfa;--a:#60a5fa;}
+ *{box-sizing:border-box}html,body{margin:0;height:100%;font:14px/1.45 "Segoe UI",system-ui,Roboto,sans-serif;
+   background:radial-gradient(1200px 800px at 30% -10%,#16203a 0%,var(--bg) 60%);color:var(--txt)}
+ #app{display:flex;height:100vh}
+ #main{flex:1;position:relative;overflow:hidden}
+ #bar{position:absolute;left:16px;top:12px;z-index:5;font-weight:700;font-size:15px;letter-spacing:.02em;
+   text-shadow:0 1px 6px rgba(0,0,0,.6)}
+ #bar small{display:block;font-weight:500;font-size:11px;color:var(--mut);margin-top:2px;max-width:520px}
+ #panel{width:340px;flex:0 0 340px;background:linear-gradient(180deg,#161d2e,#121826);border-left:1px solid var(--line);
+   padding:18px;overflow:auto;box-shadow:-8px 0 30px rgba(0,0,0,.35)}
+ #panel h2{font-size:14px;margin:0 0 6px;line-height:1.35}#panel .k{color:var(--mut);font-size:12px}
+ .row{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px dashed var(--line);font-size:12px}
+ .row b{font-weight:700}.pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:11px;font-weight:700}
+ .bar{height:8px;border-radius:5px;background:#0b1120;overflow:hidden;margin:3px 0 4px}.bar>span{display:block;height:100%;border-radius:5px}
+ #hint{position:absolute;left:16px;bottom:12px;color:var(--mut);font-size:11px}
+ #legend{position:absolute;right:16px;top:12px;font-size:11px;color:var(--mut);background:rgba(11,16,28,.72);
+   backdrop-filter:blur(6px);padding:10px 12px;border-radius:10px;border:1px solid var(--line);box-shadow:0 8px 24px rgba(0,0,0,.4)}
+ #legend .r{display:flex;align-items:center;gap:7px;padding:2px 0}#legend .sw{width:18px;height:11px;border-radius:3px}
  svg{width:100%;height:100%;cursor:grab}svg.drag{cursor:grabbing}
- .node{cursor:pointer}.node text{fill:var(--txt);pointer-events:none}.node .s{font-size:11px;font-weight:700}
- .node .m{font-size:10px;fill:var(--mut)}
+ .node{cursor:pointer}.node text{fill:var(--txt);pointer-events:none}
+ .ttl{font-size:12.5px;font-weight:600}.hdr{font-size:10px;font-weight:800;letter-spacing:.1em}
+ .m{font-size:10px;fill:var(--mut)}.sc{font-size:13px;font-weight:800}
 </style></head><body><div id="app">
- <div id="main"><svg id="svg"><g id="view"></g></svg>
+ <div id="main">
+   <svg id="svg"><defs>
+     <filter id="sh" x="-40%" y="-40%" width="180%" height="180%"><feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#000" flood-opacity="0.55"/></filter>
+     <linearGradient id="grad-green" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#22c55e" stop-opacity=".30"/><stop offset="1" stop-color="#22c55e" stop-opacity=".05"/></linearGradient>
+     <linearGradient id="grad-amber" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#eab308" stop-opacity=".30"/><stop offset="1" stop-color="#eab308" stop-opacity=".05"/></linearGradient>
+     <linearGradient id="grad-red" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ef4444" stop-opacity=".30"/><stop offset="1" stop-color="#ef4444" stop-opacity=".05"/></linearGradient>
+     <linearGradient id="grad-abstain" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#64748b" stop-opacity=".30"/><stop offset="1" stop-color="#64748b" stop-opacity=".05"/></linearGradient>
+     <linearGradient id="grad-question" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#a78bfa" stop-opacity=".34"/><stop offset="1" stop-color="#a78bfa" stop-opacity=".06"/></linearGradient>
+     <linearGradient id="grad-answer" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#60a5fa" stop-opacity=".34"/><stop offset="1" stop-color="#60a5fa" stop-opacity=".06"/></linearGradient>
+   </defs><g id="view"></g></svg>
+   <div id="bar">__TITLE__<small id="sub"></small></div>
    <div id="legend"></div>
    <div id="hint">scroll = zoom · drag = pan · click a node for its scoring</div></div>
- <div id="panel"><div class="k">Select a node</div><h2>__TITLE__</h2>
+ <div id="panel"><div class="k">Select a node</div><h2 id="ptitle">Claim tree</h2>
    <div class="k" id="thr"></div><div id="detail" style="margin-top:12px"></div></div>
 </div><script>
-const G=__PAYLOAD__, NS="http://www.w3.org/2000/svg", NW=232, NH=66;
+const G=__PAYLOAD__, NS="http://www.w3.org/2000/svg", NW=252, NH=96;
 const BAND={green:"#22c55e",amber:"#eab308",red:"#ef4444",abstain:"#64748b"};
+const ACC={question:"#a78bfa",answer:"#60a5fa"};
 const $=id=>document.getElementById(id);
 function el(t,a){const e=document.createElementNS(NS,t);for(const k in(a||{}))e.setAttribute(k,a[k]);return e;}
 const pct=v=>v==null?"—":Math.round(v*100)+"%";
-$("thr").textContent="axiom threshold = "+pct(G.axiom_threshold)+" (load-bearing parents)";
+$("sub").textContent=(G.question?("Q: "+G.question):"")||(G.source?("source: "+G.source):"");
+$("thr").textContent="axiom threshold = "+pct(G.axiom_threshold)+" (all load-bearing parents)";
 $("legend").innerHTML=["green","amber","red","abstain"].map(b=>`<div class="r"><span class="sw" style="background:${BAND[b]}"></span>${b}</div>`).join("")
-  +`<div class="r" style="margin-top:4px"><span class="sw" style="border-top:2px solid #94a3b8;height:0"></span>AND (load-bearing)</div>`
-  +`<div class="r"><span class="sw" style="border-top:2px dashed #94a3b8;height:0"></span>OR (alternative)</div>`;
+  +`<div class="r" style="margin-top:5px"><span class="sw" style="border-top:2px solid #7c93c9;height:0"></span>entails / supports</div>`
+  +`<div class="r"><span class="sw" style="border-top:2px solid #93a3c9;height:0"></span>AND (sibling)</div>`
+  +`<div class="r"><span class="sw" style="border-top:2px dashed #eab308;height:0"></span>OR (alternative)</div>`;
+// wrap text into up to `lines` lines of ~max chars, ellipsis on overflow (never spills the box)
+function wrapN(s,max,lines){s=(s||"").trim();const w=s.split(/\s+/);const L=[""];
+  for(const x of w){const i=L.length-1;
+    if(((L[i]?L[i]+" ":"")+x).length<=max)L[i]=(L[i]?L[i]+" ":"")+x;
+    else if(L.length<lines)L.push(x);
+    else{L[i]=L[i].slice(0,Math.max(0,max-1))+"…";return L;}}
+  return L;}
+function chip(x,y,txt,color){const g=el("g",{});const w=txt.length*5.7+12;
+  g.appendChild(el("rect",{x:x-w/2,y:y-8.5,width:w,height:16,rx:8,ry:8,fill:"#0b1120",stroke:"#28324e","stroke-width":1}));
+  const t=el("text",{x:x,y:y+3,"text-anchor":"middle","font-size":9.5,"font-weight":700,fill:color||"#aeb8d0"});t.textContent=txt;g.appendChild(t);return g;}
 function drawBar(v){const c=v==null?BAND.abstain:(v>=0.75?BAND.green:v>=0.5?BAND.amber:BAND.red);
   return `<div class="bar"><span style="width:${Math.round((v||0)*100)}%;background:${c}"></span></div>`;}
 function detail(n){
-  if(n.kind==="answer"){$("detail").innerHTML=`<h2>Answer</h2><div style="font-size:13px">${(n.full||"").replace(/</g,"&lt;")}</div>
-    <div class="k" style="margin-top:10px">The answer decomposes into the base claims (anchored + orphan) to its right.</div>`;return;}
+  if(n.kind==="question"||n.kind==="answer"){
+    $("ptitle").textContent=n.kind==="question"?"Question":"Answer";
+    $("detail").innerHTML=`<div style="font-size:13px;line-height:1.5">${(n.full||"").replace(/</g,"&lt;")}</div>
+      <div class="k" style="margin-top:12px">${n.kind==="question"?"Answered by the model; the answer decomposes into the base claims.":"Decomposes into the base claims (anchored + orphan) to the right."}</div>`;return;}
+  $("ptitle").textContent="Claim scoring";
   const rows=[];
   const sub=(k,v)=>v==null?"":`<div class="row"><span>${k}</span><b>${pct(v)}</b></div>${drawBar(v)}`;
   rows.push(`<h2>${(n.full||n.label).replace(/</g,"&lt;")}</h2>`);
-  rows.push(`<div style="margin:6px 0 10px"><span class="pill" style="background:${BAND[n.band]}22;color:${BAND[n.band]}">${n.kind} · ${n.band}</span>
-     <span style="float:right;font-weight:700;font-size:18px">${pct(n.score)}</span></div>`);
+  rows.push(`<div style="margin:6px 0 12px"><span class="pill" style="background:${BAND[n.band]}22;color:${BAND[n.band]}">${n.kind} · ${n.band}</span>
+     <span style="float:right;font-weight:800;font-size:20px;color:${BAND[n.band]}">${pct(n.score)}</span></div>`);
   if(n.kind!=="orphan"){
     rows.push(`<div class="k" style="margin-bottom:2px">truthfulness sub-scores</div>`);
     rows.push(sub("groundedness",n.groundedness));
     rows.push(sub("source attribution",n.source_attribution));
     rows.push(sub("source quality",n.source_quality));
-    rows.push(`<div class="row"><span>own truthfulness = min(3)</span><b>${pct(n.own_truthfulness)}</b></div>`);
+    rows.push(`<div class="row"><span>min(truthfulness) = weakest of 3</span><b>${pct(n.own_truthfulness)}</b></div>`);
   }
   if(n.kind==="derived"){
-    rows.push(`<div class="k" style="margin:10px 0 2px">logic</div>`);
+    rows.push(`<div class="k" style="margin:12px 0 2px">logic</div>`);
     rows.push(sub("logical completeness",n.reasoning_fidelity));
     rows.push(`<div class="row"><span>load-bearing parents min (m)</span><b>${pct(n.parent_min)}</b></div>`);
     const ax=n.parent_min!=null&&n.parent_min>=G.axiom_threshold;
-    rows.push(`<div class="k" style="margin-top:6px">${ax
+    rows.push(`<div class="k" style="margin-top:6px;color:${ax?'#22c55e':'#eab308'}">${ax
       ?"m ≥ "+pct(G.axiom_threshold)+" → score = max(logical completeness, min truthfulness)"
       :"m < "+pct(G.axiom_threshold)+" → logical completeness INVALID → score = min(truthfulness)"}</div>`);
   }
   if(n.kind==="orphan"){rows.push(sub("relevance (stub)",n.relevance));}
-  rows.push(`<div class="k" style="margin:12px 0 2px">rule applied</div><div style="font-size:12px">${n.branch}</div>`);
+  rows.push(`<div class="k" style="margin:14px 0 2px">rule applied</div><div style="font-size:12px">${n.branch}</div>`);
   if(n.note)rows.push(`<div class="k" style="margin-top:8px">${n.note}</div>`);
   $("detail").innerHTML=rows.join("");
 }
-function elabel(x,y,txt,anchor){const t=el("text",{x:x,y:y,"text-anchor":anchor||"middle","font-size":10,fill:"#aeb8d0"});t.textContent=txt;return t;}
+function drawEdge(view,e,a,b){
+  const x1=a.x+NW,y1=a.y+NH/2,x2=b.x,y2=b.y+NH/2,mx=(x1+x2)/2;
+  const derive=e.kind==="derives",spine=e.kind==="decomposes"||e.kind==="asks";
+  const col=derive?(e.relation==="or"?"#eab308":"#7c93c9"):"#465579";
+  const dash=spine?"3 4":(derive&&e.relation==="or"?"7 5":"");
+  view.appendChild(el("path",{d:`M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`,fill:"none",
+    stroke:col,opacity:derive?0.92:0.5,"stroke-linecap":"round",
+    "stroke-width":derive?(e.load_bearing?2.3:1.5):1.3,"stroke-dasharray":dash}));
+  if(e.label)view.appendChild(chip(mx,(y1+y2)/2,e.label,derive?"#c3ccff":"#93a0bd"));
+}
+function drawNode(view,n){
+  const g=el("g",{class:"node",transform:`translate(${n.x},${n.y})`});
+  if(n.type==="question"||n.type==="answer"){
+    const acc=ACC[n.type];
+    g.appendChild(el("rect",{width:NW,height:NH,rx:15,ry:15,fill:`url(#grad-${n.type})`,stroke:acc,"stroke-width":2,filter:"url(#sh)"}));
+    const h=el("text",{x:15,y:22,class:"hdr",fill:acc});h.textContent=n.type.toUpperCase();g.appendChild(h);
+    wrapN(n.full||n.label,36,3).forEach((ln,i)=>{const t=el("text",{x:15,y:40+i*15,"font-size":11});t.textContent=ln;g.appendChild(t);});
+    g.addEventListener("click",()=>detail(n));view.appendChild(g);return;
+  }
+  const c=BAND[n.band]||BAND.abstain;
+  g.appendChild(el("rect",{width:NW,height:NH,rx:15,ry:15,fill:`url(#grad-${n.band})`,
+    stroke:n.orphan?"#ef4444":c,"stroke-width":2,"stroke-dasharray":n.orphan?"6 5":"",filter:"url(#sh)"}));
+  g.appendChild(el("rect",{x:0,y:0,width:5,height:NH,rx:2,ry:2,fill:c}));   // accent spine
+  wrapN(n.label,30,2).forEach((ln,i)=>{const t=el("text",{x:16,y:26+i*17,class:"ttl"});t.textContent=ln;g.appendChild(t);});
+  const meta=el("text",{x:16,y:70,class:"m"});
+  meta.textContent=n.kind+(n.kind==="derived"?` · m=${pct(n.parent_min)}`:(n.kind==="orphan"?" · relevance stub":" · min(3)"));g.appendChild(meta);
+  const s=el("text",{x:NW-14,y:86,"text-anchor":"end",class:"sc",fill:c});s.textContent=pct(n.score)+" · "+n.band;g.appendChild(s);
+  g.addEventListener("click",()=>detail(n));view.appendChild(g);
+}
+function drawSibling(view,a,b,rel){        // vertical bracket in the gutter, drawn ON TOP, linking the boxes
+  const col=a.x,gx=col-24,y1=a.y+NH/2,y2=b.y+NH/2,my=(y1+y2)/2;
+  const c=rel==="or"?"#eab308":"#93a3c9",dash=rel==="or"?"5 4":"";
+  const st={fill:"none",stroke:c,"stroke-width":1.7,"stroke-linecap":"round","stroke-dasharray":dash};
+  view.appendChild(el("path",{d:`M${gx},${y1} L${gx},${y2}`,...st}));
+  view.appendChild(el("path",{d:`M${gx},${y1} L${col},${y1}`,...st}));
+  view.appendChild(el("path",{d:`M${gx},${y2} L${col},${y2}`,...st}));
+  view.appendChild(chip(gx,my,rel.toUpperCase(),c));
+}
 function draw(){
   const view=$("view");view.innerHTML="";const pos={};G.nodes.forEach(n=>pos[n.id]=n);
-  G.edges.forEach(e=>{const a=pos[e.source],b=pos[e.target];if(!a||!b)return;
-    if(e.kind==="sibling"){                       // vertical AND/OR connector just left of the column
-      const x=a.x-16,y1=a.y+NH/2,y2=b.y+NH/2;
-      view.appendChild(el("path",{d:`M${x},${y1} L${x},${y2}`,fill:"none",stroke:"#8b97b5",
-        "stroke-width":1.4,"stroke-dasharray":e.relation==="or"?"5 4":""}));
-      view.appendChild(elabel(x-5,(y1+y2)/2+3,e.relation.toUpperCase(),"end"));
-      return;
-    }
-    const x1=a.x+NW,y1=a.y+NH/2,x2=b.x,y2=b.y+NH/2,mx=(x1+x2)/2;
-    const decomp=e.kind==="decomposes";
-    view.appendChild(el("path",{d:`M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`,fill:"none",
-      stroke:decomp?"#5a6785":"#94a3b8",opacity:decomp?0.55:(e.load_bearing?0.9:0.5),
-      "stroke-width":decomp?1.2:(e.load_bearing?2:1.3),
-      "stroke-dasharray":decomp?"2 3":(e.relation==="or"?"6 4":"")}));
-    if(e.label)view.appendChild(elabel(mx,(y1+y2)/2-4,e.label));
-  });
-  G.nodes.forEach(n=>{
-    if(n.type==="answer"){
-      const g=el("g",{class:"node",transform:`translate(${n.x},${n.y})`});
-      g.appendChild(el("rect",{width:NW,height:NH,rx:10,ry:10,fill:"#3b82f61f",stroke:"#3b82f6","stroke-width":2}));
-      const h=el("text",{x:12,y:20,class:"m"});h.textContent="ANSWER";g.appendChild(h);
-      const t=el("text",{x:12,y:42});t.textContent=n.label.length>34?n.label.slice(0,33)+"…":n.label;g.appendChild(t);
-      g.addEventListener("click",()=>detail(n));view.appendChild(g);return;
-    }
-    const c=BAND[n.band]||BAND.abstain;
-    const g=el("g",{class:"node",transform:`translate(${n.x},${n.y})`});
-    g.appendChild(el("rect",{width:NW,height:NH,rx:10,ry:10,fill:c+"1f",
-      stroke:n.orphan?"#ef4444":c,"stroke-width":2,"stroke-dasharray":n.orphan?"5 3":""}));
-    const t=el("text",{x:12,y:22});t.textContent=n.label;g.appendChild(t);
-    const m=el("text",{x:12,y:40,class:"m"});m.textContent=n.kind+(n.kind==="derived"?` · m=${pct(n.parent_min)}`:"");g.appendChild(m);
-    const s=el("text",{x:12,y:56,class:"s",fill:c});s.textContent=pct(n.score)+" "+n.band+(n.kind==="anchored"?" · min(3)":"");g.appendChild(s);
-    g.addEventListener("click",()=>detail(n));view.appendChild(g);});
+  G.edges.forEach(e=>{if(e.kind==="sibling")return;const a=pos[e.source],b=pos[e.target];if(a&&b)drawEdge(view,e,a,b);});
+  G.nodes.forEach(n=>drawNode(view,n));
+  G.edges.forEach(e=>{if(e.kind!=="sibling")return;const a=pos[e.source],b=pos[e.target];if(a&&b)drawSibling(view,a,b,e.relation);});
   fit();
 }
 let vx=0,vy=0,vs=1;const apply=()=>$("view").setAttribute("transform",`translate(${vx},${vy}) scale(${vs})`);
 function fit(){const xs=G.nodes.map(n=>n.x),ys=G.nodes.map(n=>n.y);if(!xs.length)return;
   const w=$("main").clientWidth,h=$("main").clientHeight;
-  const maxx=Math.max(...xs)+NW+40,maxy=Math.max(...ys)+NH+40,minx=Math.min(...xs)-20,miny=Math.min(...ys)-20;
+  const maxx=Math.max(...xs)+NW+50,maxy=Math.max(...ys)+NH+50,minx=Math.min(...xs)-50,miny=Math.min(...ys)-30;
   vs=Math.min(1,Math.min(w/(maxx-minx),h/(maxy-miny)));vx=-minx*vs+10;vy=-miny*vs+10;apply();}
 const svg=$("svg");
 svg.addEventListener("wheel",e=>{e.preventDefault();const f=e.deltaY<0?1.1:0.9;const r=svg.getBoundingClientRect();
@@ -487,5 +564,6 @@ svg.addEventListener("wheel",e=>{e.preventDefault();const f=e.deltaY<0?1.1:0.9;c
 let dn=false,px,py;svg.addEventListener("mousedown",e=>{dn=true;px=e.clientX;py=e.clientY;svg.classList.add("drag");});
 addEventListener("mouseup",()=>{dn=false;svg.classList.remove("drag");});
 addEventListener("mousemove",e=>{if(!dn)return;vx+=e.clientX-px;vy+=e.clientY-py;px=e.clientX;py=e.clientY;apply();});
-draw();if(G.nodes.length)detail(G.nodes.find(n=>n.kind!=="anchored")||G.nodes[0]);
+draw();
+if(G.nodes.length)detail(G.nodes.find(n=>n.kind==="derived")||G.nodes.find(n=>n.kind!=="answer"&&n.kind!=="question")||G.nodes[0]);
 </script></body></html>"""
