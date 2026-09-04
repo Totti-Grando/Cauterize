@@ -31,20 +31,31 @@ def test_derived_above_axiom_takes_max_of_own_and_reasoning():
                   source_quality=0.6, reasoning_fidelity=0.9, parents=[ParentLink("p")]),
     )
     assert t["d"].parent_min == pytest.approx(0.8)
-    assert t["d"].score == pytest.approx(0.9)          # max(own=0.6, rf=0.9)
-    assert "max(own,rf)" in t["d"].branch
+    assert t["d"].score == pytest.approx(0.9)          # max(logical_completeness=0.9, min_truthfulness=0.6)
+    assert "max(logical_completeness" in t["d"].branch
 
 
-def test_derived_below_axiom_takes_min_of_own_and_reasoning():
-    # weak premise -> reasoning is meaningless -> min pulls it down
+def test_derived_below_axiom_is_min_truthfulness_only():
+    # weak premise -> logical completeness is INVALID and dropped -> score = min(truthfulness)
     t = _tree(
         ClaimNode(id="p", text="weak premise", kind="anchored", groundedness=0.5, source_attribution=0.5, source_quality=0.5),
         ClaimNode(id="d", text="derived", kind="derived", groundedness=0.6, source_attribution=0.6,
                   source_quality=0.6, reasoning_fidelity=0.9, parents=[ParentLink("p")]),
     )
     assert t["d"].parent_min == pytest.approx(0.5)
-    assert t["d"].score == pytest.approx(0.6)          # min(own=0.6, rf=0.9)
-    assert "min(own,rf)" in t["d"].branch
+    assert t["d"].score == pytest.approx(0.6)          # min(truthfulness)=0.6; reasoning 0.9 discarded
+    assert "min_truthfulness" in t["d"].branch
+
+
+def test_derived_below_axiom_drops_reasoning_even_when_reasoning_is_the_weaker_signal():
+    # NEW behavior: below axiom, score is min(truthfulness) alone (NOT min(own, reasoning)).
+    # own=0.6, reasoning=0.3 -> old min(own,rf) would give 0.3; new drops reasoning -> 0.6.
+    t = _tree(
+        ClaimNode(id="p", text="weak premise", kind="anchored", groundedness=0.5, source_attribution=0.5, source_quality=0.5),
+        ClaimNode(id="d", text="derived", kind="derived", groundedness=0.6, source_attribution=0.6,
+                  source_quality=0.6, reasoning_fidelity=0.3, parents=[ParentLink("p")]),
+    )
+    assert t["d"].score == pytest.approx(0.6)          # min(truthfulness), reasoning invalid & dropped
 
 
 def test_axiom_threshold_boundary_is_inclusive():
@@ -138,6 +149,54 @@ def test_to_graph_shape_and_bands():
     assert a["own_truthfulness"] == pytest.approx(0.9) and a["band"] == "green"
     e = g["edges"][0]
     assert e["source"] == "a" and e["target"] == "d" and e["relation"] == "and"
+
+
+def test_answer_node_stems_into_base_claims():
+    t = _tree(
+        ClaimNode(id="a", text="revenue rose", kind="anchored", groundedness=0.9, source_attribution=0.9, source_quality=0.9),
+        ClaimNode(id="o", text="ceo aside", kind="orphan", relevance=0.3),
+        ClaimNode(id="d", text="growth driver", kind="derived", groundedness=0.6, source_attribution=0.6,
+                  source_quality=0.6, reasoning_fidelity=0.9, parents=[ParentLink("a")]),
+    )
+    g = to_graph(t, source="unit", answer="The company grew and the CEO was upbeat.")
+    ans = next(n for n in g["nodes"] if n["type"] == "answer")
+    # answer decomposes into the base claims (anchored + orphan), NOT the derived child
+    dec = {e["target"] for e in g["edges"] if e["kind"] == "decomposes"}
+    assert dec == {"a", "o"}
+    assert all(e["source"] == ans["id"] for e in g["edges"] if e["kind"] == "decomposes")
+    # columns: answer leftmost, base claims next, derived to their right
+    xa = ans["x"]; xbase = next(n["x"] for n in g["nodes"] if n["id"] == "a")
+    xder = next(n["x"] for n in g["nodes"] if n["id"] == "d")
+    assert xa < xbase < xder
+
+
+def test_derive_edges_are_labelled_entails_or_supports():
+    t = _tree(
+        ClaimNode(id="a", text="p", kind="anchored", groundedness=0.9, source_attribution=0.9, source_quality=0.9),
+        ClaimNode(id="deco", text="deco", kind="anchored", groundedness=0.9, source_attribution=0.9, source_quality=0.9),
+        ClaimNode(id="d", text="c", kind="derived", groundedness=0.8, source_attribution=0.8, source_quality=0.8,
+                  reasoning_fidelity=0.9, parents=[ParentLink("a"), ParentLink("deco", load_bearing=False)]),
+    )
+    g = to_graph(t)
+    lab = {(e["source"], e["label"]) for e in g["edges"] if e["kind"] == "derives"}
+    assert ("a", "entails") in lab and ("deco", "supports") in lab
+
+
+def test_sibling_and_or_connectors_for_cogating_parents():
+    t = _tree(
+        ClaimNode(id="p1", text="p1", kind="anchored", groundedness=0.9, source_attribution=0.9, source_quality=0.9),
+        ClaimNode(id="p2", text="p2", kind="anchored", groundedness=0.9, source_attribution=0.9, source_quality=0.9),
+        ClaimNode(id="alt1", text="alt1", kind="anchored", groundedness=0.9, source_attribution=0.9, source_quality=0.9),
+        ClaimNode(id="alt2", text="alt2", kind="anchored", groundedness=0.9, source_attribution=0.9, source_quality=0.9),
+        # child gated by (p1 AND p2) AND (alt1 OR alt2)
+        ClaimNode(id="d", text="c", kind="derived", groundedness=0.8, source_attribution=0.8, source_quality=0.8,
+                  reasoning_fidelity=0.9, parents=[ParentLink("p1"), ParentLink("p2"),
+                                                   ParentLink("alt1", or_group="g"), ParentLink("alt2", or_group="g")]),
+    )
+    g = to_graph(t)
+    sib = [e for e in g["edges"] if e["kind"] == "sibling"]
+    rels = {e["relation"] for e in sib}
+    assert "and" in rels and "or" in rels           # AND cluster (p1,p2) + OR cluster (alt1,alt2)
 
 
 def test_band_thresholds():

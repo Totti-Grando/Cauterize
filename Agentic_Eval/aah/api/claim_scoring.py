@@ -12,15 +12,18 @@ Node kinds and their scoring (locked with the user):
 
       score = min(groundedness, source_attribution, source_quality)
 
-* **derived** — a claim reasoned from parent claims. Two of its own signals combine, but ONLY if
-  its premises are trustworthy enough to reason from — the *axiom gate*::
+* **derived** — a claim reasoned from parent claims. Its *logical completeness* (reasoning fidelity)
+  can lift it, but ONLY if its premises are trustworthy enough to reason from — the *axiom gate*::
 
       m = min( load-bearing parents' scores )          # OR-groups reduced by max; non-load-bearing excluded
-      if m >= AXIOM_THRESHOLD:   score = max(own_truthfulness, reasoning_fidelity)   # good logic can exceed thin grounding
-      else:                      score = min(own_truthfulness, reasoning_fidelity)   # reasoning from weak premises is meaningless
+      if m >= AXIOM_THRESHOLD:   score = max(logical_completeness, min(truthfulness))   # axiom-grade premises: good logic can exceed thin grounding
+      else:                      score = min(truthfulness)                              # premises below axiom: logical completeness is INVALID, dropped
 
-  This is why ``max`` is SAFE: it can only lift a claim when its load-bearing premises are already
-  axiom-grade, so coherent-but-unsupported reasoning cannot launder itself green.
+  where ``min(truthfulness) = min(groundedness, source_attribution, source_quality)`` (the claim's
+  own weakest link) and ``logical_completeness = reasoning_fidelity``. This is why ``max`` is SAFE: it
+  can only lift a claim when ALL its load-bearing premises are already axiom-grade (m >= 0.75), so
+  coherent-but-unsupported reasoning cannot launder itself green. Below the gate, logical completeness
+  is discarded entirely — reasoning from weak premises is meaningless.
 
 * **orphan** — no source anchor, no load-bearing parents, no reasoning. Its value collapses to
   relevance. Relevance is a STUB here (``relevance`` field, defaulting to an abstain) to be sharpened
@@ -55,6 +58,7 @@ class ParentLink:
     parent_id: str
     load_bearing: bool = True
     or_group: Optional[str] = None
+    relation: str = ""          # optional natural-language description of the link (e.g. "because revenue rose")
 
 
 @dataclass
@@ -123,43 +127,31 @@ def _score_node(node: ClaimNode, scored: dict[str, float]) -> None:
         node.branch = "anchored:min(3)"
         return
 
-    # derived
+    # derived — score = max(logical_completeness, min(truthfulness)) IFF all load-bearing parents are
+    # axiom-grade (m >= AXIOM_THRESHOLD); otherwise logical completeness is invalid -> min(truthfulness).
     m = _gate_value(node, scored)
     node.parent_min = m
-    rf = node.reasoning_fidelity
-    two = [v for v in (own, rf) if v is not None]
+    lc = node.reasoning_fidelity            # logical completeness
+    truth = own                             # min(truthfulness) = min of the present sub-scores
 
     if m is None:
         # tagged derived but has no usable load-bearing parents — degenerate. Fall back to whatever
-        # the claim can stand on itself (own truthfulness, else reasoning, else abstain).
-        node.score = own if own is not None else rf
+        # the claim can stand on itself (own truthfulness, else logical completeness, else abstain).
+        node.score = truth if truth is not None else lc
         node.branch = "derived:no-parents→self"
         node.note = "derived claim with no load-bearing parents; scored on its own signals"
         return
 
-    if not two:
-        # nothing about the claim itself; it can be no stronger than its weakest premise.
-        node.score = m
-        node.branch = "derived:self-signals-missing→parent_min"
-        return
-
-    if len(two) == 1:
-        # only one of {own, reasoning} present; max/min of a single value is itself. The gate still
-        # matters when reasoning is the lone signal: below threshold, reasoning is meaningless.
-        if rf is not None and own is None and m < AXIOM_THRESHOLD:
-            node.score = min(rf, m)
-            node.branch = "derived:reasoning-only,below-axiom→min(rf,m)"
-        else:
-            node.score = two[0]
-            node.branch = "derived:single-signal"
-        return
-
     if m >= AXIOM_THRESHOLD:
-        node.score = max(own, rf)
-        node.branch = f"derived:axiom(m={m:.2f}≥{AXIOM_THRESHOLD})→max(own,rf)"
+        # premises are axiom-grade -> logical completeness is VALID and may lift the claim
+        cands = [v for v in (lc, truth) if v is not None]
+        node.score = max(cands) if cands else m
+        node.branch = f"derived:axiom(m={m:.2f}≥{AXIOM_THRESHOLD})→max(logical_completeness, min_truthfulness)"
     else:
-        node.score = min(own, rf)
-        node.branch = f"derived:below-axiom(m={m:.2f}<{AXIOM_THRESHOLD})→min(own,rf)"
+        # premises below axiom -> logical completeness INVALID, dropped; claim stands on truthfulness
+        node.score = truth if truth is not None else m
+        node.branch = f"derived:below-axiom(m={m:.2f}<{AXIOM_THRESHOLD})→min_truthfulness"
+        node.note = "load-bearing premises below axiom threshold; logical completeness discarded"
 
 
 def score_tree(nodes: dict[str, ClaimNode]) -> dict[str, ClaimNode]:
@@ -202,9 +194,20 @@ def band(score: Optional[float]) -> str:
     return "red"
 
 
-def to_graph(nodes: dict[str, ClaimNode], *, source: str = "") -> dict:
-    """Convert a scored claim tree into the {nodes, edges, stats} shape the renderer consumes."""
+def to_graph(nodes: dict[str, ClaimNode], *, source: str = "", answer: str = "") -> dict:
+    """Convert a scored claim tree into the {nodes, edges, stats} shape the renderer consumes.
+
+    ``answer`` (optional) adds a leftmost ANSWER node that the base claims (anchored + orphan) stem
+    from. Edge kinds: ``decomposes`` (answer → base claim), ``derives`` (parent → child, labelled
+    'entails' for a load-bearing premise else 'supports'), and ``sibling`` (a vertical AND / OR
+    connector between the parents that JOINTLY gate the same child — co-gating siblings only)."""
     gnodes = []
+    if answer:
+        gnodes.append({
+            "id": "__answer__", "type": "answer", "kind": "answer", "orphan": False,
+            "label": (answer[:90] + "…") if len(answer) > 90 else answer, "full": answer,
+            "score": None, "band": "abstain",
+        })
     for n in nodes.values():
         gnodes.append({
             "id": n.id, "type": n.kind, "label": (n.text[:60] + "…") if len(n.text) > 60 else n.text,
@@ -216,13 +219,21 @@ def to_graph(nodes: dict[str, ClaimNode], *, source: str = "") -> dict:
             "threshold": AXIOM_THRESHOLD, "orphan": n.kind == "orphan",
         })
     gedges = []
+    if answer:
+        for n in nodes.values():
+            if n.kind in ("anchored", "orphan"):
+                gedges.append({"source": "__answer__", "target": n.id, "kind": "decomposes",
+                               "relation": "stem", "load_bearing": False, "label": ""})
     for n in nodes.values():
         for link in n.parents:
             gedges.append({
-                "source": link.parent_id, "target": n.id, "kind": "supports",
+                "source": link.parent_id, "target": n.id, "kind": "derives",
                 "relation": "or" if link.or_group else "and",
                 "load_bearing": link.load_bearing, "or_group": link.or_group,
+                "label": link.relation or ("entails" if link.load_bearing else "supports"),
             })
+    _layout(gnodes, gedges, has_answer=bool(answer))
+    gedges.extend(_sibling_edges(nodes, gnodes))       # vertical AND/OR after positions are known
     stats = {
         "nodes": len(gnodes), "edges": len(gedges),
         "anchored": sum(1 for n in nodes.values() if n.kind == "anchored"),
@@ -231,20 +242,57 @@ def to_graph(nodes: dict[str, ClaimNode], *, source: str = "") -> dict:
         "bands": {b: sum(1 for n in nodes.values() if band(n.score) == b)
                   for b in ("green", "amber", "red", "abstain")},
     }
-    _layout(gnodes, gedges)
-    return {"source": source, "nodes": gnodes, "edges": gedges, "stats": stats,
+    return {"source": source, "answer": answer, "nodes": gnodes, "edges": gedges, "stats": stats,
             "axiom_threshold": AXIOM_THRESHOLD}
 
 
-# --- DAG layout: evidence (leaves) on the left, conclusions on the right ------------
+def _sibling_edges(nodes: dict[str, ClaimNode], gnodes: list[dict]) -> list[dict]:
+    """Vertical AND/OR connectors between parents that JOINTLY gate the same child. Load-bearing
+    non-OR parents form the AND cluster; each ``or_group`` is an OR cluster. Only members sharing a
+    column are connected (consecutive by y). Half-siblings (parents of different children, or non-
+    load-bearing) get no link."""
+    pos = {n["id"]: n for n in gnodes}
+    out: list[dict] = []
+    seen: set = set()
+    for child in nodes.values():
+        loose: list[str] = []
+        groups: dict[str, list[str]] = {}
+        for link in child.parents:
+            if not link.load_bearing or link.parent_id not in pos:
+                continue
+            if link.or_group:
+                groups.setdefault(link.or_group, []).append(link.parent_id)
+            else:
+                loose.append(link.parent_id)
+        clusters = [("and", loose)] + [("or", ids) for ids in groups.values()]
+        for rel, ids in clusters:
+            bycol: dict[float, list[str]] = {}
+            for i in ids:
+                bycol.setdefault(pos[i]["x"], []).append(i)
+            for col_ids in bycol.values():
+                if len(col_ids) < 2:
+                    continue
+                col_ids.sort(key=lambda i: pos[i]["y"])
+                for a, b in zip(col_ids, col_ids[1:]):
+                    key = (a, b, rel)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append({"source": a, "target": b, "kind": "sibling",
+                                "relation": rel, "child": child.id})
+    return out
+
+
+# --- DAG layout: answer → base claims (anchored/orphan) → derived children ----------
 _COL_W, _ROW_H = 300, 104
 
 
-def _layout(gnodes: list[dict], gedges: list[dict]) -> None:
-    """Layer each node by its longest dependency depth (leaves=0), then stack within the layer."""
+def _layout(gnodes: list[dict], gedges: list[dict], *, has_answer: bool = False) -> None:
+    """Column by longest DERIVE depth (base claims=0), shifted right by one when an answer node is
+    present. The answer sits leftmost, vertically centered on the base column."""
     parents_of: dict[str, list[str]] = {n["id"]: [] for n in gnodes}
     for e in gedges:
-        if e["target"] in parents_of:
+        if e["kind"] == "derives" and e["target"] in parents_of:
             parents_of[e["target"]].append(e["source"])
     depth: dict[str, int] = {}
 
@@ -258,16 +306,24 @@ def _layout(gnodes: list[dict], gedges: list[dict]) -> None:
         depth[nid] = val
         return val
 
-    for n in gnodes:
+    claim_nodes = [n for n in gnodes if n["type"] != "answer"]
+    for n in claim_nodes:
         d(n["id"])
+    off = 1 if has_answer else 0
     by_layer: dict[int, list[dict]] = {}
-    for n in gnodes:
+    for n in claim_nodes:
         by_layer.setdefault(depth[n["id"]], []).append(n)
     for layer, group in by_layer.items():
         group.sort(key=lambda n: (0 if not n.get("orphan") else 1, n["id"]))
         for i, n in enumerate(group):
-            n["x"] = 80 + layer * _COL_W
+            n["x"] = 80 + (layer + off) * _COL_W
             n["y"] = 60 + i * _ROW_H
+    if has_answer:
+        base = by_layer.get(0, [])
+        ay = (sum(n["y"] for n in base) / len(base)) if base else 60
+        for n in gnodes:
+            if n["type"] == "answer":
+                n["x"], n["y"] = 80, ay
 
 
 def demo_claim_tree() -> dict[str, ClaimNode]:
@@ -355,6 +411,8 @@ $("legend").innerHTML=["green","amber","red","abstain"].map(b=>`<div class="r"><
 function drawBar(v){const c=v==null?BAND.abstain:(v>=0.75?BAND.green:v>=0.5?BAND.amber:BAND.red);
   return `<div class="bar"><span style="width:${Math.round((v||0)*100)}%;background:${c}"></span></div>`;}
 function detail(n){
+  if(n.kind==="answer"){$("detail").innerHTML=`<h2>Answer</h2><div style="font-size:13px">${(n.full||"").replace(/</g,"&lt;")}</div>
+    <div class="k" style="margin-top:10px">The answer decomposes into the base claims (anchored + orphan) to its right.</div>`;return;}
   const rows=[];
   const sub=(k,v)=>v==null?"":`<div class="row"><span>${k}</span><b>${pct(v)}</b></div>${drawBar(v)}`;
   rows.push(`<h2>${(n.full||n.label).replace(/</g,"&lt;")}</h2>`);
@@ -368,29 +426,53 @@ function detail(n){
     rows.push(`<div class="row"><span>own truthfulness = min(3)</span><b>${pct(n.own_truthfulness)}</b></div>`);
   }
   if(n.kind==="derived"){
-    rows.push(`<div class="k" style="margin:10px 0 2px">reasoning</div>`);
-    rows.push(sub("reasoning fidelity",n.reasoning_fidelity));
+    rows.push(`<div class="k" style="margin:10px 0 2px">logic</div>`);
+    rows.push(sub("logical completeness",n.reasoning_fidelity));
     rows.push(`<div class="row"><span>load-bearing parents min (m)</span><b>${pct(n.parent_min)}</b></div>`);
+    const ax=n.parent_min!=null&&n.parent_min>=G.axiom_threshold;
+    rows.push(`<div class="k" style="margin-top:6px">${ax
+      ?"m ≥ "+pct(G.axiom_threshold)+" → score = max(logical completeness, min truthfulness)"
+      :"m < "+pct(G.axiom_threshold)+" → logical completeness INVALID → score = min(truthfulness)"}</div>`);
   }
   if(n.kind==="orphan"){rows.push(sub("relevance (stub)",n.relevance));}
   rows.push(`<div class="k" style="margin:12px 0 2px">rule applied</div><div style="font-size:12px">${n.branch}</div>`);
   if(n.note)rows.push(`<div class="k" style="margin-top:8px">${n.note}</div>`);
   $("detail").innerHTML=rows.join("");
 }
+function elabel(x,y,txt,anchor){const t=el("text",{x:x,y:y,"text-anchor":anchor||"middle","font-size":10,fill:"#aeb8d0"});t.textContent=txt;return t;}
 function draw(){
   const view=$("view");view.innerHTML="";const pos={};G.nodes.forEach(n=>pos[n.id]=n);
   G.edges.forEach(e=>{const a=pos[e.source],b=pos[e.target];if(!a||!b)return;
+    if(e.kind==="sibling"){                       // vertical AND/OR connector just left of the column
+      const x=a.x-16,y1=a.y+NH/2,y2=b.y+NH/2;
+      view.appendChild(el("path",{d:`M${x},${y1} L${x},${y2}`,fill:"none",stroke:"#8b97b5",
+        "stroke-width":1.4,"stroke-dasharray":e.relation==="or"?"5 4":""}));
+      view.appendChild(elabel(x-5,(y1+y2)/2+3,e.relation.toUpperCase(),"end"));
+      return;
+    }
     const x1=a.x+NW,y1=a.y+NH/2,x2=b.x,y2=b.y+NH/2,mx=(x1+x2)/2;
+    const decomp=e.kind==="decomposes";
     view.appendChild(el("path",{d:`M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`,fill:"none",
-      stroke:"#94a3b8",opacity:e.load_bearing?0.9:0.5,"stroke-width":e.load_bearing?2:1.3,
-      "stroke-dasharray":e.relation==="or"?"6 4":""}));});
-  G.nodes.forEach(n=>{const c=BAND[n.band]||BAND.abstain;
+      stroke:decomp?"#5a6785":"#94a3b8",opacity:decomp?0.55:(e.load_bearing?0.9:0.5),
+      "stroke-width":decomp?1.2:(e.load_bearing?2:1.3),
+      "stroke-dasharray":decomp?"2 3":(e.relation==="or"?"6 4":"")}));
+    if(e.label)view.appendChild(elabel(mx,(y1+y2)/2-4,e.label));
+  });
+  G.nodes.forEach(n=>{
+    if(n.type==="answer"){
+      const g=el("g",{class:"node",transform:`translate(${n.x},${n.y})`});
+      g.appendChild(el("rect",{width:NW,height:NH,rx:10,ry:10,fill:"#3b82f61f",stroke:"#3b82f6","stroke-width":2}));
+      const h=el("text",{x:12,y:20,class:"m"});h.textContent="ANSWER";g.appendChild(h);
+      const t=el("text",{x:12,y:42});t.textContent=n.label.length>34?n.label.slice(0,33)+"…":n.label;g.appendChild(t);
+      g.addEventListener("click",()=>detail(n));view.appendChild(g);return;
+    }
+    const c=BAND[n.band]||BAND.abstain;
     const g=el("g",{class:"node",transform:`translate(${n.x},${n.y})`});
     g.appendChild(el("rect",{width:NW,height:NH,rx:10,ry:10,fill:c+"1f",
       stroke:n.orphan?"#ef4444":c,"stroke-width":2,"stroke-dasharray":n.orphan?"5 3":""}));
     const t=el("text",{x:12,y:22});t.textContent=n.label;g.appendChild(t);
     const m=el("text",{x:12,y:40,class:"m"});m.textContent=n.kind+(n.kind==="derived"?` · m=${pct(n.parent_min)}`:"");g.appendChild(m);
-    const s=el("text",{x:12,y:56,class:"s",fill:c});s.textContent=pct(n.score)+" "+n.band;g.appendChild(s);
+    const s=el("text",{x:12,y:56,class:"s",fill:c});s.textContent=pct(n.score)+" "+n.band+(n.kind==="anchored"?" · min(3)":"");g.appendChild(s);
     g.addEventListener("click",()=>detail(n));view.appendChild(g);});
   fit();
 }

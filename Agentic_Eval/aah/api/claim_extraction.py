@@ -60,6 +60,7 @@ class ClaimParent:
     parent_id: str
     load_bearing: bool = True
     or_group: Optional[str] = None
+    relation: str = ""          # short natural-language description of the link (e.g. "because revenue rose")
 
 
 @dataclass
@@ -200,15 +201,24 @@ class StubClaimExtractor:
 
 
 _EXTRACT_SYSTEM = (
-    "You decompose an ANSWER into atomic claims for a truthfulness audit. Return ONLY a JSON array; "
+    "You decompose an ANSWER into ATOMIC claims for a truthfulness audit. Return ONLY a JSON array; "
     "each element: {\"id\": \"c0\", \"text\": \"...\", \"kind\": \"anchored|derived|orphan\", "
-    "\"parents\": [{\"id\": \"c1\", \"load_bearing\": true, \"or_group\": null}], "
+    "\"parents\": [{\"id\": \"c1\", \"load_bearing\": true, \"or_group\": null, \"relation\": \"...\"}], "
     "\"reasoning_steps\": [\"...\"]}. "
-    "anchored = a factual assertion meant to be grounded directly in a source. "
-    "derived = a conclusion inferred from other claims (list them in parents; load_bearing=false for "
-    "merely supporting, non-essential parents; give the same or_group to interchangeable alternatives). "
-    "orphan = a floating aside grounded in neither a source nor other claims. "
-    "Keep ids stable and referenced only after they are defined where possible."
+    "ATOMICITY (critical): each claim must state EXACTLY ONE checkable assertion — one subject, one "
+    "predicate, one value. Split any sentence joining multiple facts (and/but/;/that also) into "
+    "separate claims. A claim must be able to stand alone as a single true/false check. "
+    "DESCRIPTIVE & SELF-CONTAINED: resolve pronouns and shorthand so each claim is understandable on "
+    "its own (write 'Acme's Q3 revenue was $4.2B', not 'it rose 12%'); do not merge two facts to save "
+    "words. "
+    "anchored = a factual assertion meant to be grounded directly in a source (a BASE claim). "
+    "derived = a conclusion inferred from other claims. List every premise in parents. Set "
+    "load_bearing=true for a premise the conclusion NEEDS (an AND term), false for merely supporting "
+    "context; give the SAME or_group id to interchangeable alternatives (an OR term). For each parent "
+    "add a short 'relation' phrase describing the link (e.g. 'because revenue rose', 'assuming demand "
+    "holds'). Build these relationships freely — a rich parent/child tree is expected. "
+    "orphan = a floating aside (subjective, or grounded in neither a source nor other claims). "
+    "Keep ids stable and reference a parent only after it is defined where possible."
 )
 
 
@@ -254,7 +264,8 @@ def _coerce_claims(data: Any) -> list[ExtractedClaim]:
         if not isinstance(c, dict):
             continue
         parents = [
-            ClaimParent(str(p.get("id")), bool(p.get("load_bearing", True)), p.get("or_group"))
+            ClaimParent(str(p.get("id")), bool(p.get("load_bearing", True)), p.get("or_group"),
+                        str(p.get("relation") or ""))
             for p in (c.get("parents") or []) if isinstance(p, dict) and p.get("id")
         ]
         out.append(ExtractedClaim(
@@ -387,7 +398,7 @@ async def build_claim_nodes(
 
     for c in extracted:
         node = ClaimNode(id=c.id, text=c.text, kind=c.kind,
-                         parents=[ParentLink(p.parent_id, p.load_bearing, p.or_group) for p in c.parents])
+                         parents=[ParentLink(p.parent_id, p.load_bearing, p.or_group, p.relation) for p in c.parents])
         if c.kind == "orphan":
             # STUB relevance: how much the floating fact relates to what was ASKED (not the answer
             # it came from). Deliberately thin — the real per-claim relevance judge lands later.
@@ -474,7 +485,7 @@ async def build_claim_nodes_retrieval(
     nodes: dict[str, ClaimNode] = {}
     for c in extracted:
         node = ClaimNode(id=c.id, text=c.text, kind=c.kind,
-                         parents=[ParentLink(p.parent_id, p.load_bearing, p.or_group) for p in c.parents])
+                         parents=[ParentLink(p.parent_id, p.load_bearing, p.or_group, p.relation) for p in c.parents])
         if c.kind == "orphan":
             node.relevance = round(_overlap(c.text, question), 4) if question else 0.3
         else:
