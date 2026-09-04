@@ -491,6 +491,7 @@ async def build_claim_nodes_retrieval(
         else:
             g = grounded.get(fact[c.id])
             node.groundedness = g["score"] if g else 0.0
+            node.grounded_source = g.get("source_id") if g else None       # corpus link for the graph
             node.source_attribution = attribution.get(c.id)
             node.source_quality = _quality_from_evidence(c.text, evidence)
             if c.kind == "derived":

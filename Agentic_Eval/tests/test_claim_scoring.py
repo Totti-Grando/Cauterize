@@ -216,5 +216,28 @@ def test_sibling_and_or_connectors_for_cogating_parents():
     assert "and" in rels and "or" in rels           # AND cluster (p1,p2) + OR cluster (alt1,alt2)
 
 
+def test_sources_render_as_nodes_with_grounds_edges_and_orphans():
+    a = ClaimNode(id="a", text="grounded claim", kind="anchored",
+                  groundedness=0.9, source_attribution=0.9, source_quality=0.9)
+    a.grounded_source = "filing"
+    t = _tree(a)
+    sources = [
+        {"id": "filing", "title": "10-Q", "domain": "sec.gov", "support": "strong", "fetch_success": True},
+        {"id": "unused", "title": "News", "domain": "n.com", "support": "strong", "fetch_success": True},
+        {"id": "portal", "title": "Portal", "domain": "p.com", "support": "n/a", "fetch_success": False},
+    ]
+    g = to_graph(t, answer="an answer", sources=sources)
+    srcnodes = {n["id"]: n for n in g["nodes"] if n["type"] == "source"}
+    assert set(srcnodes) == {"src:filing", "src:unused", "src:portal"}
+    # the grounded claim points to its source
+    assert any(e["kind"] == "grounds" and e["source"] == "a" and e["target"] == "src:filing" for e in g["edges"])
+    # a source nothing grounds to, and a failed fetch, are orphans; the grounded one is not
+    assert not srcnodes["src:filing"].get("orphan")
+    assert srcnodes["src:unused"]["orphan"] and "grounds no claim" in srcnodes["src:unused"]["orphan_reason"]
+    assert srcnodes["src:portal"]["orphan"] and "retriev" in srcnodes["src:portal"]["orphan_reason"]
+    # sources sit in the rightmost column (past the claim)
+    assert srcnodes["src:filing"]["x"] > next(n["x"] for n in g["nodes"] if n["id"] == "a")
+
+
 def test_band_thresholds():
     assert band(0.9) == "green" and band(0.6) == "amber" and band(0.2) == "red" and band(None) == "abstain"

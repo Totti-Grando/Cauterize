@@ -75,6 +75,8 @@ class ClaimNode:
     parents: list[ParentLink] = field(default_factory=list)
     # orphan-only (STUB — relevance to be enhanced later)
     relevance: Optional[float] = None
+    # corpus link: the source id this claim grounded against (set by the retrieval binder), for the graph
+    grounded_source: Optional[str] = None
     # --- computed by score_tree (do not set by hand) ---
     own_truthfulness: Optional[float] = None      # min of the three sub-scores
     parent_min: Optional[float] = None            # m — the axiom gate value
@@ -195,7 +197,7 @@ def band(score: Optional[float]) -> str:
 
 
 def to_graph(nodes: dict[str, ClaimNode], *, source: str = "", answer: str = "",
-             question: str = "") -> dict:
+             question: str = "", sources: Optional[list] = None) -> dict:
     """Convert a scored claim tree into the {nodes, edges, stats} shape the renderer consumes.
 
     Optional roots build the left spine: ``question`` → ``answer`` → base claims (anchored + orphan)
@@ -224,6 +226,16 @@ def to_graph(nodes: dict[str, ClaimNode], *, source: str = "", answer: str = "",
             "relevance": n.relevance, "branch": n.branch, "note": n.note,
             "threshold": AXIOM_THRESHOLD, "orphan": n.kind == "orphan",
         })
+    # corpus: source-document nodes (the claims ground against these)
+    for s in (sources or []):
+        sid = str(s.get("id") or s.get("title") or "src")
+        gnodes.append({
+            "id": "src:" + sid, "type": "source", "kind": "source", "orphan": False,
+            "label": s.get("title") or s.get("domain") or sid, "full": s.get("quote") or s.get("text") or "",
+            "domain": s.get("domain"), "support": s.get("support"),
+            "fetch_success": s.get("fetch_success", s.get("fetchSuccess", True)),
+            "score": None, "band": "abstain",
+        })
     gedges = []
     if question and answer:
         gedges.append({"source": "__question__", "target": "__answer__", "kind": "asks",
@@ -242,6 +254,23 @@ def to_graph(nodes: dict[str, ClaimNode], *, source: str = "", answer: str = "",
                 "load_bearing": link.load_bearing, "or_group": link.or_group,
                 "label": link.relation or ("entails" if link.load_bearing else "supports"),
             })
+    # grounds edges: a claim that actually grounded points to the source that entailed it
+    src_ids = {n["id"] for n in gnodes if n["type"] == "source"}
+    grounded_srcs: set = set()
+    for n in nodes.values():
+        sid = "src:" + str(n.grounded_source) if n.grounded_source else None
+        if sid in src_ids and (n.groundedness or 0) >= 0.5:
+            gedges.append({"source": n.id, "target": sid, "kind": "grounds",
+                           "relation": "grounds", "load_bearing": False, "label": "grounds in"})
+            grounded_srcs.add(sid)
+    # a source no claim grounds to (or a failed fetch) is an orphan
+    for gn in gnodes:
+        if gn["type"] != "source":
+            continue
+        if not gn.get("fetch_success"):
+            gn["orphan"], gn["orphan_reason"] = True, "source could not be retrieved"
+        elif gn["id"] not in grounded_srcs:
+            gn["orphan"], gn["orphan_reason"] = True, "source grounds no claim in this answer"
     _layout(gnodes, gedges, has_answer=bool(answer), has_question=bool(question))
     gedges.extend(_sibling_edges(nodes, gnodes))       # vertical AND/OR after positions are known
     stats = {
@@ -319,7 +348,7 @@ def _layout(gnodes: list[dict], gedges: list[dict], *, has_answer: bool = False,
         depth[nid] = val
         return val
 
-    claim_nodes = [n for n in gnodes if n["type"] not in ("answer", "question")]
+    claim_nodes = [n for n in gnodes if n["type"] not in ("answer", "question", "source")]
     for n in claim_nodes:
         d(n["id"])
     off = (1 if has_question else 0) + (1 if has_answer else 0)
@@ -359,6 +388,14 @@ def _layout(gnodes: list[dict], gedges: list[dict], *, has_answer: bool = False,
         for n in gnodes:
             if n["type"] == "question":
                 n["x"], n["y"] = 80, cy
+
+    # corpus column: source docs to the right of the deepest claim column (non-orphan first)
+    srcs = [n for n in gnodes if n["type"] == "source"]
+    if srcs:
+        srcs.sort(key=lambda n: (1 if n.get("orphan") else 0, n["id"]))
+        sx = 80 + (off + maxd + 1) * _COL_W
+        for i, n in enumerate(srcs):
+            n["x"], n["y"] = sx, 60 + i * _ROW_H
 
 
 def demo_claim_tree() -> dict[str, ClaimNode]:
@@ -445,6 +482,7 @@ _TREE_HTML = r"""<!doctype html>
      <linearGradient id="grad-abstain" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#64748b" stop-opacity=".30"/><stop offset="1" stop-color="#64748b" stop-opacity=".05"/></linearGradient>
      <linearGradient id="grad-question" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#a78bfa" stop-opacity=".34"/><stop offset="1" stop-color="#a78bfa" stop-opacity=".06"/></linearGradient>
      <linearGradient id="grad-answer" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#60a5fa" stop-opacity=".34"/><stop offset="1" stop-color="#60a5fa" stop-opacity=".06"/></linearGradient>
+     <linearGradient id="grad-source" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#10b981" stop-opacity=".30"/><stop offset="1" stop-color="#10b981" stop-opacity=".05"/></linearGradient>
    </defs><g id="view"></g></svg>
    <div id="bar">__TITLE__<small id="sub"></small></div>
    <div id="legend"></div>
@@ -463,7 +501,9 @@ $("thr").textContent="axiom threshold = "+pct(G.axiom_threshold)+" (all load-bea
 $("legend").innerHTML=["green","amber","red","abstain"].map(b=>`<div class="r"><span class="sw" style="background:${BAND[b]}"></span>${b}</div>`).join("")
   +`<div class="r" style="margin-top:5px"><span class="sw" style="border-top:2px solid #7c93c9;height:0"></span>entails / supports</div>`
   +`<div class="r"><span class="sw" style="border-top:2px solid #93a3c9;height:0"></span>AND (sibling)</div>`
-  +`<div class="r"><span class="sw" style="border-top:2px dashed #eab308;height:0"></span>OR (alternative)</div>`;
+  +`<div class="r"><span class="sw" style="border-top:2px dashed #eab308;height:0"></span>OR (alternative)</div>`
+  +`<div class="r" style="margin-top:5px"><span class="sw" style="background:#10b981"></span>source doc (corpus)</div>`
+  +`<div class="r"><span class="sw" style="border-top:2px solid #10b981;height:0"></span>grounds in</div>`;
 // wrap text into up to `lines` lines of ~max chars, ellipsis on overflow (never spills the box)
 function wrapN(s,max,lines){s=(s||"").trim();const w=s.split(/\s+/);const L=[""];
   for(const x of w){const i=L.length-1;
@@ -481,6 +521,14 @@ function detail(n){
     $("ptitle").textContent=n.kind==="question"?"Question":"Answer";
     $("detail").innerHTML=`<div style="font-size:13px;line-height:1.5">${(n.full||"").replace(/</g,"&lt;")}</div>
       <div class="k" style="margin-top:12px">${n.kind==="question"?"Answered by the model; the answer decomposes into the base claims.":"Decomposes into the base claims (anchored + orphan) to the right."}</div>`;return;}
+  if(n.kind==="source"){
+    $("ptitle").textContent="Source document";
+    $("detail").innerHTML=`<h2>${(n.label||"").replace(/</g,"&lt;")}</h2>
+      <div class="row"><span>domain</span><b>${n.domain||"—"}</b></div>
+      <div class="row"><span>support</span><b>${n.support||"n/a"}</b></div>
+      <div class="row"><span>fetched</span><b>${n.fetch_success?"yes":"no"}</b></div>
+      ${n.full?`<div class="k" style="margin-top:10px">“${(n.full||"").replace(/</g,"&lt;")}”</div>`:""}
+      ${n.orphan?`<div class="k" style="margin-top:10px;color:#ef4444">orphan — ${n.orphan_reason||""}</div>`:`<div class="k" style="margin-top:10px;color:#10b981">grounds one or more claims</div>`}`;return;}
   $("ptitle").textContent="Claim scoring";
   const rows=[];
   const sub=(k,v)=>v==null?"":`<div class="row"><span>${k}</span><b>${pct(v)}</b></div>${drawBar(v)}`;
@@ -510,13 +558,13 @@ function detail(n){
 }
 function drawEdge(view,e,a,b){
   const x1=a.x+NW,y1=a.y+NH/2,x2=b.x,y2=b.y+NH/2,mx=(x1+x2)/2;
-  const derive=e.kind==="derives",spine=e.kind==="decomposes"||e.kind==="asks";
-  const col=derive?(e.relation==="or"?"#eab308":"#7c93c9"):"#465579";
+  const derive=e.kind==="derives",spine=e.kind==="decomposes"||e.kind==="asks",grounds=e.kind==="grounds";
+  const col=grounds?"#10b981":(derive?(e.relation==="or"?"#eab308":"#7c93c9"):"#465579");
   const dash=spine?"3 4":(derive&&e.relation==="or"?"7 5":"");
   view.appendChild(el("path",{d:`M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`,fill:"none",
-    stroke:col,opacity:derive?0.92:0.5,"stroke-linecap":"round",
-    "stroke-width":derive?(e.load_bearing?2.3:1.5):1.3,"stroke-dasharray":dash}));
-  if(e.label)view.appendChild(chip(mx,(y1+y2)/2,e.label,derive?"#c3ccff":"#93a0bd"));
+    stroke:col,opacity:grounds?0.85:(derive?0.92:0.5),"stroke-linecap":"round",
+    "stroke-width":grounds?2:(derive?(e.load_bearing?2.3:1.5):1.3),"stroke-dasharray":dash}));
+  if(e.label)view.appendChild(chip(mx,(y1+y2)/2,e.label,grounds?"#7ff0c4":(derive?"#c3ccff":"#93a0bd")));
 }
 function drawNode(view,n){
   const g=el("g",{class:"node",transform:`translate(${n.x},${n.y})`});
@@ -525,6 +573,15 @@ function drawNode(view,n){
     g.appendChild(el("rect",{width:NW,height:NH,rx:15,ry:15,fill:`url(#grad-${n.type})`,stroke:acc,"stroke-width":2,filter:"url(#sh)"}));
     const h=el("text",{x:15,y:22,class:"hdr",fill:acc});h.textContent=n.type.toUpperCase();g.appendChild(h);
     wrapN(n.full||n.label,36,3).forEach((ln,i)=>{const t=el("text",{x:15,y:40+i*15,"font-size":11});t.textContent=ln;g.appendChild(t);});
+    g.addEventListener("click",()=>detail(n));view.appendChild(g);return;
+  }
+  if(n.type==="source"){
+    const acc="#10b981";
+    g.appendChild(el("rect",{width:NW,height:NH,rx:15,ry:15,fill:"url(#grad-source)",
+      stroke:n.orphan?"#ef4444":acc,"stroke-width":2,"stroke-dasharray":n.orphan?"6 5":"",filter:"url(#sh)"}));
+    const h=el("text",{x:15,y:22,class:"hdr",fill:n.orphan?"#ef4444":acc});h.textContent="SOURCE";g.appendChild(h);
+    wrapN(n.label,32,2).forEach((ln,i)=>{const t=el("text",{x:15,y:42+i*16,class:"ttl"});t.textContent=ln;g.appendChild(t);});
+    const m=el("text",{x:15,y:NH-10,class:"m"});m.textContent=(n.domain||"")+" · "+(n.support||"n/a")+(n.orphan?" · orphan":"");g.appendChild(m);
     g.addEventListener("click",()=>detail(n));view.appendChild(g);return;
   }
   const c=BAND[n.band]||BAND.abstain;
