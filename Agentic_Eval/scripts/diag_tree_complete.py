@@ -50,8 +50,25 @@ CLAIMS = [
 async def main():
     tree = await build_claim_nodes_retrieval(CLAIMS, question=QUESTION, sources=SOURCES,
                                              evidence=EVIDENCE, k=8, tau=0.5)
+    # tag each claim with the evaluation dimension it's scored under (rubric lane)
+    for cid in ("c0", "c1", "c2", "c3", "c4"):
+        tree[cid].dimension = "factual_consistency"
+    tree["c5"].dimension = "explainability"
+    tree["c6"].dimension = "relevance"
+    fc = round(sum(tree[c].groundedness for c in ("c0", "c1", "c2", "c3", "c4")) / 5, 2)
+    DIMENSIONS = [
+      # exercised (a claim is scored under them)
+      {"dimension": "factual_consistency", "category": "evidence_truthfulness", "tier": "major", "gating": False, "score": fc, "weight": 2.0},
+      {"dimension": "explainability", "category": "reasoning", "tier": "minor", "gating": False, "score": tree["c5"].score, "weight": 1.0},
+      {"dimension": "relevance", "category": "response_quality", "tier": "major", "gating": False, "score": tree["c6"].score, "weight": 1.0},
+      # configured-but-idle (no claim under them) -> hidden until "show idle dimensions"
+      {"dimension": "toxicity", "category": "safety", "tier": "critical", "gating": True, "score": None, "weight": 0.0},
+      {"dimension": "pii_leakage", "category": "privacy_security", "tier": "critical", "gating": True, "score": None, "weight": 0.0},
+      {"dimension": "clarity", "category": "communication", "tier": "minor", "gating": False, "score": None, "weight": 1.0},
+      {"dimension": "retrieval_precision", "category": "rag_quality", "tier": "major", "gating": False, "score": None, "weight": 1.0},
+    ]
     graph = cs.to_graph(tree, source="acme-q3-2024 (real DeBERTa)", question=QUESTION,
-                        answer=ANSWER, sources=SOURCES)
+                        answer=ANSWER, sources=SOURCES, dimensions=DIMENSIONS)
     out = os.path.abspath("claim_tree_complete.html")
     open(out, "w", encoding="utf-8").write(cs.render_html(graph, title="Claim Tree — complete (corpus + scoring)"))
 

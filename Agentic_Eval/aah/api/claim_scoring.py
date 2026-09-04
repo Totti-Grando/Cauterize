@@ -77,6 +77,8 @@ class ClaimNode:
     relevance: Optional[float] = None
     # corpus link: the source id this claim grounded against (set by the retrieval binder), for the graph
     grounded_source: Optional[str] = None
+    # rubric link: the evaluation dimension this claim is scored under (for the graph's dimension lane)
+    dimension: Optional[str] = None
     # --- computed by score_tree (do not set by hand) ---
     own_truthfulness: Optional[float] = None      # min of the three sub-scores
     parent_min: Optional[float] = None            # m — the axiom gate value
@@ -197,7 +199,8 @@ def band(score: Optional[float]) -> str:
 
 
 def to_graph(nodes: dict[str, ClaimNode], *, source: str = "", answer: str = "",
-             question: str = "", sources: Optional[list] = None) -> dict:
+             question: str = "", sources: Optional[list] = None,
+             dimensions: Optional[list] = None) -> dict:
     """Convert a scored claim tree into the {nodes, edges, stats} shape the renderer consumes.
 
     Optional roots build the left spine: ``question`` → ``answer`` → base claims (anchored + orphan)
@@ -236,6 +239,18 @@ def to_graph(nodes: dict[str, ClaimNode], *, source: str = "", answer: str = "",
             "fetch_success": s.get("fetch_success", s.get("fetchSuccess", True)),
             "score": None, "band": "abstain",
         })
+    # rubric: evaluation-dimension nodes (the claims are scored under these)
+    for dim in (dimensions or []):
+        dname = dim.get("dimension")
+        if not dname:
+            continue
+        gnodes.append({
+            "id": "dim:" + dname, "type": "dimension", "kind": "dimension", "orphan": False,
+            "label": dname.replace("_", " "), "full": dname, "dimension": dname,
+            "category": dim.get("category"), "tier": dim.get("tier"), "gating": dim.get("gating"),
+            "score": dim.get("score"), "weight": dim.get("weight"),
+            "band": band(dim.get("score")) if dim.get("score") is not None else "abstain",
+        })
     gedges = []
     if question and answer:
         gedges.append({"source": "__question__", "target": "__answer__", "kind": "asks",
@@ -271,6 +286,18 @@ def to_graph(nodes: dict[str, ClaimNode], *, source: str = "", answer: str = "",
             gn["orphan"], gn["orphan_reason"] = True, "source could not be retrieved"
         elif gn["id"] not in grounded_srcs:
             gn["orphan"], gn["orphan_reason"] = True, "source grounds no claim in this answer"
+    # scored_in edges: a claim tagged with a dimension links to that dimension node
+    dim_ids = {n["id"] for n in gnodes if n["type"] == "dimension"}
+    scored_dims: set = set()
+    for n in nodes.values():
+        did = "dim:" + str(n.dimension) if n.dimension else None
+        if did in dim_ids:
+            gedges.append({"source": n.id, "target": did, "kind": "scored_in",
+                           "relation": "scored", "load_bearing": False, "label": ""})
+            scored_dims.add(did)
+    for gn in gnodes:                                  # a configured dimension no claim touches is idle
+        if gn["type"] == "dimension":
+            gn["exercised"] = gn["id"] in scored_dims
     _layout(gnodes, gedges, has_answer=bool(answer), has_question=bool(question))
     gedges.extend(_sibling_edges(nodes, gnodes))       # vertical AND/OR after positions are known
     stats = {
@@ -348,7 +375,7 @@ def _layout(gnodes: list[dict], gedges: list[dict], *, has_answer: bool = False,
         depth[nid] = val
         return val
 
-    claim_nodes = [n for n in gnodes if n["type"] not in ("answer", "question", "source")]
+    claim_nodes = [n for n in gnodes if n["type"] not in ("answer", "question", "source", "dimension")]
     for n in claim_nodes:
         d(n["id"])
     off = (1 if has_question else 0) + (1 if has_answer else 0)
@@ -396,6 +423,21 @@ def _layout(gnodes: list[dict], gedges: list[dict], *, has_answer: bool = False,
         sx = 80 + (off + maxd + 1) * _COL_W
         for i, n in enumerate(srcs):
             n["x"], n["y"] = sx, 60 + i * _ROW_H
+
+    # rubric column: evaluation dimensions, far right, exercised first then idle, banded by category
+    dims = [n for n in gnodes if n["type"] == "dimension"]
+    if dims:
+        dims.sort(key=lambda n: (0 if n.get("exercised") else 1, n.get("category") or "~", n["id"]))
+        dx = 80 + (off + maxd + 2) * _COL_W
+        y = 60
+        prev = None
+        for n in dims:
+            cat = (0 if n.get("exercised") else 1, n.get("category") or "~")
+            if prev is not None and cat != prev:
+                y += 40
+            prev = cat
+            n["x"], n["y"] = dx, y
+            y += _ROW_H
 
 
 def demo_claim_tree() -> dict[str, ClaimNode]:
@@ -483,8 +525,11 @@ _TREE_HTML = r"""<!doctype html>
      <linearGradient id="grad-question" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#a78bfa" stop-opacity=".34"/><stop offset="1" stop-color="#a78bfa" stop-opacity=".06"/></linearGradient>
      <linearGradient id="grad-answer" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#60a5fa" stop-opacity=".34"/><stop offset="1" stop-color="#60a5fa" stop-opacity=".06"/></linearGradient>
      <linearGradient id="grad-source" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#10b981" stop-opacity=".30"/><stop offset="1" stop-color="#10b981" stop-opacity=".05"/></linearGradient>
+     <linearGradient id="grad-dimension" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f59e0b" stop-opacity=".28"/><stop offset="1" stop-color="#f59e0b" stop-opacity=".05"/></linearGradient>
    </defs><g id="view"></g></svg>
-   <div id="bar">__TITLE__<small id="sub"></small></div>
+   <div id="bar">__TITLE__<small id="sub"></small>
+     <label style="display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:500;margin-top:6px;cursor:pointer">
+       <input type="checkbox" id="showIdle"/> show idle dimensions</label></div>
    <div id="legend"></div>
    <div id="hint">scroll = zoom · drag = pan · click a node for its scoring</div></div>
  <div id="panel"><div class="k">Select a node</div><h2 id="ptitle">Claim tree</h2>
@@ -503,7 +548,9 @@ $("legend").innerHTML=["green","amber","red","abstain"].map(b=>`<div class="r"><
   +`<div class="r"><span class="sw" style="border-top:2px solid #93a3c9;height:0"></span>AND (sibling)</div>`
   +`<div class="r"><span class="sw" style="border-top:2px dashed #eab308;height:0"></span>OR (alternative)</div>`
   +`<div class="r" style="margin-top:5px"><span class="sw" style="background:#10b981"></span>source doc (corpus)</div>`
-  +`<div class="r"><span class="sw" style="border-top:2px solid #10b981;height:0"></span>grounds in</div>`;
+  +`<div class="r"><span class="sw" style="border-top:2px solid #10b981;height:0"></span>grounds in</div>`
+  +`<div class="r" style="margin-top:5px"><span class="sw" style="background:#f59e0b"></span>dimension (rubric)</div>`
+  +`<div class="r"><span class="sw" style="border-top:2px dashed #6b8afd;height:0"></span>scored in</div>`;
 // wrap text into up to `lines` lines of ~max chars, ellipsis on overflow (never spills the box)
 function wrapN(s,max,lines){s=(s||"").trim();const w=s.split(/\s+/);const L=[""];
   for(const x of w){const i=L.length-1;
@@ -529,6 +576,14 @@ function detail(n){
       <div class="row"><span>fetched</span><b>${n.fetch_success?"yes":"no"}</b></div>
       ${n.full?`<div class="k" style="margin-top:10px">“${(n.full||"").replace(/</g,"&lt;")}”</div>`:""}
       ${n.orphan?`<div class="k" style="margin-top:10px;color:#ef4444">orphan — ${n.orphan_reason||""}</div>`:`<div class="k" style="margin-top:10px;color:#10b981">grounds one or more claims</div>`}`;return;}
+  if(n.kind==="dimension"){
+    $("ptitle").textContent="Evaluation dimension";
+    $("detail").innerHTML=`<h2>${(n.label||"").replace(/</g,"&lt;")}</h2>
+      <div class="row"><span>category</span><b>${n.category||"—"}</b></div>
+      <div class="row"><span>tier</span><b>${n.tier||"—"}${n.gating?" · gating":""}</b></div>
+      <div class="row"><span>score</span><b>${pct(n.score)}</b></div>
+      <div class="row"><span>weight</span><b>${n.weight==null?"—":n.weight}</b></div>
+      <div class="k" style="margin-top:10px">${n.exercised===false?"idle — no claim is scored under this dimension in this run":"claims are scored under this dimension"}</div>`;return;}
   $("ptitle").textContent="Claim scoring";
   const rows=[];
   const sub=(k,v)=>v==null?"":`<div class="row"><span>${k}</span><b>${pct(v)}</b></div>${drawBar(v)}`;
@@ -558,12 +613,12 @@ function detail(n){
 }
 function drawEdge(view,e,a,b){
   const x1=a.x+NW,y1=a.y+NH/2,x2=b.x,y2=b.y+NH/2,mx=(x1+x2)/2;
-  const derive=e.kind==="derives",spine=e.kind==="decomposes"||e.kind==="asks",grounds=e.kind==="grounds";
-  const col=grounds?"#10b981":(derive?(e.relation==="or"?"#eab308":"#7c93c9"):"#465579");
-  const dash=spine?"3 4":(derive&&e.relation==="or"?"7 5":"");
+  const derive=e.kind==="derives",spine=e.kind==="decomposes"||e.kind==="asks",grounds=e.kind==="grounds",scored=e.kind==="scored_in";
+  const col=scored?"#6b8afd":(grounds?"#10b981":(derive?(e.relation==="or"?"#eab308":"#7c93c9"):"#465579"));
+  const dash=scored?"4 5":(spine?"3 4":(derive&&e.relation==="or"?"7 5":""));
   view.appendChild(el("path",{d:`M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`,fill:"none",
-    stroke:col,opacity:grounds?0.85:(derive?0.92:0.5),"stroke-linecap":"round",
-    "stroke-width":grounds?2:(derive?(e.load_bearing?2.3:1.5):1.3),"stroke-dasharray":dash}));
+    stroke:col,opacity:scored?0.45:(grounds?0.85:(derive?0.92:0.5)),"stroke-linecap":"round",
+    "stroke-width":scored?1.2:(grounds?2:(derive?(e.load_bearing?2.3:1.5):1.3)),"stroke-dasharray":dash}));
   if(e.label)view.appendChild(chip(mx,(y1+y2)/2,e.label,grounds?"#7ff0c4":(derive?"#c3ccff":"#93a0bd")));
 }
 function drawNode(view,n){
@@ -582,6 +637,16 @@ function drawNode(view,n){
     const h=el("text",{x:15,y:22,class:"hdr",fill:n.orphan?"#ef4444":acc});h.textContent="SOURCE";g.appendChild(h);
     wrapN(n.label,32,2).forEach((ln,i)=>{const t=el("text",{x:15,y:42+i*16,class:"ttl"});t.textContent=ln;g.appendChild(t);});
     const m=el("text",{x:15,y:NH-10,class:"m"});m.textContent=(n.domain||"")+" · "+(n.support||"n/a")+(n.orphan?" · orphan":"");g.appendChild(m);
+    g.addEventListener("click",()=>detail(n));view.appendChild(g);return;
+  }
+  if(n.type==="dimension"){
+    const acc="#f59e0b",idle=n.exercised===false;
+    g.appendChild(el("rect",{width:NW,height:NH,rx:15,ry:15,fill:"url(#grad-dimension)",stroke:acc,
+      "stroke-width":2,opacity:idle?0.5:1,filter:"url(#sh)"}));
+    const h=el("text",{x:15,y:22,class:"hdr",fill:acc});h.textContent="DIMENSION"+(idle?" · idle":"");g.appendChild(h);
+    wrapN(n.label,30,2).forEach((ln,i)=>{const t=el("text",{x:15,y:42+i*16,class:"ttl"});t.textContent=ln;g.appendChild(t);});
+    const m=el("text",{x:15,y:NH-10,class:"m"});m.textContent=(n.category||"")+" · "+(n.tier||"?")+(n.gating?" · gating":"");g.appendChild(m);
+    if(n.score!=null){const s=el("text",{x:NW-14,y:NH-10,"text-anchor":"end",class:"sc",fill:BAND[n.band]});s.textContent=pct(n.score);g.appendChild(s);}
     g.addEventListener("click",()=>detail(n));view.appendChild(g);return;
   }
   const c=BAND[n.band]||BAND.abstain;
@@ -603,18 +668,21 @@ function drawSibling(view,a,b,rel){        // vertical bracket in the gutter, dr
   view.appendChild(el("path",{d:`M${gx},${y2} L${col},${y2}`,...st}));
   view.appendChild(chip(gx,my,rel.toUpperCase(),c));
 }
+let SHOW_IDLE=false;
+const vis=n=>SHOW_IDLE||!(n.type==="dimension"&&n.exercised===false);   // idle dims hidden by default
 function draw(){
   const view=$("view");view.innerHTML="";const pos={};G.nodes.forEach(n=>pos[n.id]=n);
-  G.edges.forEach(e=>{if(e.kind==="sibling")return;const a=pos[e.source],b=pos[e.target];if(a&&b)drawEdge(view,e,a,b);});
-  G.nodes.forEach(n=>drawNode(view,n));
+  G.edges.forEach(e=>{if(e.kind==="sibling")return;const a=pos[e.source],b=pos[e.target];if(a&&b&&vis(a)&&vis(b))drawEdge(view,e,a,b);});
+  G.nodes.forEach(n=>{if(vis(n))drawNode(view,n);});
   G.edges.forEach(e=>{if(e.kind!=="sibling")return;const a=pos[e.source],b=pos[e.target];if(a&&b)drawSibling(view,a,b,e.relation);});
   fit();
 }
 let vx=0,vy=0,vs=1;const apply=()=>$("view").setAttribute("transform",`translate(${vx},${vy}) scale(${vs})`);
-function fit(){const xs=G.nodes.map(n=>n.x),ys=G.nodes.map(n=>n.y);if(!xs.length)return;
+function fit(){const V=G.nodes.filter(vis),xs=V.map(n=>n.x),ys=V.map(n=>n.y);if(!xs.length)return;
   const w=$("main").clientWidth,h=$("main").clientHeight;
   const maxx=Math.max(...xs)+NW+50,maxy=Math.max(...ys)+NH+50,minx=Math.min(...xs)-50,miny=Math.min(...ys)-30;
   vs=Math.min(1,Math.min(w/(maxx-minx),h/(maxy-miny)));vx=-minx*vs+10;vy=-miny*vs+10;apply();}
+const _ci=$("showIdle");if(_ci){_ci.checked=SHOW_IDLE;_ci.addEventListener("change",e=>{SHOW_IDLE=e.target.checked;draw();});}
 const svg=$("svg");
 svg.addEventListener("wheel",e=>{e.preventDefault();const f=e.deltaY<0?1.1:0.9;const r=svg.getBoundingClientRect();
   const mx=e.clientX-r.left,my=e.clientY-r.top;vx=mx-(mx-vx)*f;vy=my-(my-vy)*f;vs*=f;apply();},{passive:false});
