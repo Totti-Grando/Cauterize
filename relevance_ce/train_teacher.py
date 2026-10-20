@@ -47,6 +47,9 @@ def main():
     set_seed(args.seed)
     rng = random.Random(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    # bf16 where the GPU supports it (Ampere+, e.g. RTX 5080); otherwise run fp32 so
+    # older free-tier GPUs (Kaggle T4/P100) stay numerically stable without a grad scaler.
+    amp_dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else None
 
     train, val, test = [], [], []
     for p in args.data:
@@ -56,6 +59,8 @@ def main():
 
     model, tok, src = build_model(args.init, attn_impl=args.attn)
     print("init:", src)
+    if device == "cuda":
+        print("amp:", "bf16" if amp_dtype is not None else "off (fp32)")
     model.to(device)
 
     cw = None
@@ -97,7 +102,7 @@ def main():
             enc = encode_batch(tok, pairs, args.max_length, device)
             y = torch.tensor([L2I[r["label"]] for r in batch], device=device)
             w = torch.tensor([float(r.get("weight", 1.0)) for r in batch], device=device)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=(device == "cuda")):
+            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=(device == "cuda" and amp_dtype is not None)):
                 logits = model(**enc)
             loss = F.cross_entropy(logits.float(), y, weight=cw, label_smoothing=args.label_smoothing,
                                    reduction="none")
