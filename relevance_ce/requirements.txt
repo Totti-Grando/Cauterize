@@ -1,0 +1,9 @@
+torch>=2.7
+transformers>=4.51
+sentence-transformers>=5.5
+datasets
+numpy
+onnx
+onnxruntime
+onnxscript
+anthropic

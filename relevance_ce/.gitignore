@@ -1,0 +1,14 @@
+# relevance_ce — keep code + docs in git, keep heavy/generated artifacts out.
+# Note: the repo-root .gitignore already ignores *.jsonl, runs/, and .venv/.
+
+# Trained checkpoints & exported models
+deploy/
+models/
+*.onnx
+*.onnx_data
+
+# Downloaded public datasets (2wiki, musique, etc.)
+raw/
+
+# Generated CSVs from the labeling/adjudication passes
+data/*.csv
