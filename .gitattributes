@@ -1,0 +1,2 @@
+relevance_ce/**/*.onnx filter=lfs diff=lfs merge=lfs -text
+relevance_ce/deploy/** filter=lfs diff=lfs merge=lfs -text
