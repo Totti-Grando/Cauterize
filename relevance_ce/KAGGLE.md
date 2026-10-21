@@ -74,14 +74,11 @@ TempReason is skipped: its HF default lacks `fact_context` and yields 0 rows (ne
 
 ### Cell 7 — push the trained model back through Git LFS (int8 only, to respect the 1 GB LFS cap)
 ```python
-# push only what you serve; skip the ~600 MB fp32 model.onnx to stay under free LFS quota
-!git -C /kaggle/working/Cauterize add -f \
-    relevance_ce/deploy/model-150m/model.int8.onnx \
-    relevance_ce/deploy/model-150m/meta.json \
-    relevance_ce/deploy/model-150m/report.json \
-    relevance_ce/deploy/model-150m/tokenizer
-!git -C /kaggle/working/Cauterize commit -m "Kaggle run: trained + exported teacher-150m (synthetic + hotpotqa)"
-!git -C /kaggle/working/Cauterize push origin HEAD:feature/relevance-ce
+# push only what you serve; skip the ~600 MB fp32 model.onnx to stay under free LFS quota.
+# Each !command must be ONE line — no backslash continuations (Jupyter parses them as Python).
+!cd /kaggle/working/Cauterize && git add -f relevance_ce/deploy/model-150m/model.int8.onnx relevance_ce/deploy/model-150m/meta.json relevance_ce/deploy/model-150m/report.json relevance_ce/deploy/model-150m/tokenizer
+!cd /kaggle/working/Cauterize && git commit -m "Kaggle run: trained + exported teacher-150m (synthetic + hotpotqa)"
+!cd /kaggle/working/Cauterize && git push origin HEAD:feature/relevance-ce
 ```
 If this fails with an LFS over-quota error, don't retrain — the model is saved in the Kaggle
 **version Output** (`Cauterize/relevance_ce/deploy/model-150m/`); download it from there instead.
